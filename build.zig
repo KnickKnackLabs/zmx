@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("clap", clap_dep.module("clap"));
     }
 
+    {
+        const zigcli_dep = b.dependency("zigcli", .{});
+        exe_mod.addImport("zigcli", zigcli_dep.module("zigcli"));
+    }
+
     if (b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
@@ -113,6 +118,11 @@ pub fn build(b: *std.Build) void {
             {
                 const clap_dep = b.dependency("clap", .{});
                 release_mod.addImport("clap", clap_dep.module("clap"));
+            }
+
+            {
+                const zigcli_dep = b.dependency("zigcli", .{});
+                release_mod.addImport("zigcli", zigcli_dep.module("zigcli"));
             }
 
             if (b.lazyDependency("ghostty", .{
