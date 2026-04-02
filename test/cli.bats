@@ -190,6 +190,12 @@ load test_helper
   [[ "$output" == *"Invalid argument"* ]]
 }
 
+@test "rm --help: shows subcommand usage" {
+  run "$ZMX" rm --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Usage: zmx rm"* ]]
+}
+
 @test "history --vt --html: mutually exclusive flags error" {
   run "$ZMX" history test --vt --html
   [ "$status" -ne 0 ]
