@@ -1386,7 +1386,9 @@ fn list(cfg: *Cfg, mode: list_mod.Mode) !void {
             try stdout.interface.flush();
         },
         .table => {
-            try list_mod.writeTable(&stdout.interface, sessions.items, current_session, alloc);
+            const zigcli_term = @import("zigcli").term;
+            const use_color = zigcli_term.isTty(std.fs.File.stdout());
+            try list_mod.writeTable(&stdout.interface, sessions.items, current_session, alloc, use_color);
             try stdout.interface.flush();
         },
     }

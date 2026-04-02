@@ -99,13 +99,15 @@ fn statusCell(status: []const u8, session: SessionEntry, use_color: bool) pretty
 }
 
 /// Write a table of sessions to the writer using pretty-table.
+/// When `use_color` is true, output includes ANSI styling (bold headers,
+/// colored status). Callers should pass `term.isTty(stdout)` or similar.
 pub fn writeTable(
     writer: *std.Io.Writer,
     sessions: []const SessionEntry,
     current_session: ?[]const u8,
     alloc: std.mem.Allocator,
+    use_color: bool,
 ) !void {
-    const use_color = term.isTty(std.fs.File.stdout());
 
     var table = pretty_table.Table(4).Owned.init(.{
         .mode = .ascii,
@@ -161,6 +163,31 @@ pub fn writeTable(
     try table.format(writer);
 }
 
+/// Write a JSON-escaped string value (without surrounding quotes).
+/// Escapes per RFC 8259: \", \\, control chars below 0x20.
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    // Control character — \u00XX
+                    var buf: [6]u8 = undefined;
+                    _ = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                    try writer.writeAll(&buf);
+                } else {
+                    const buf: [1]u8 = .{c};
+                    try writer.writeAll(&buf);
+                }
+            },
+        }
+    }
+}
+
 /// Write sessions as a JSON array.
 pub fn writeJson(
     writer: *std.Io.Writer,
@@ -172,11 +199,15 @@ pub fn writeJson(
         if (i > 0) try writer.writeAll(",");
         try writer.writeAll("\n  {");
 
-        try writer.print("\"name\":\"{s}\"", .{session.name});
+        try writer.writeAll("\"name\":\"");
+        try writeJsonString(writer, session.name);
+        try writer.writeAll("\"");
 
         var status_buf: [32]u8 = undefined;
         const status = formatStatus(&status_buf, session);
-        try writer.print(",\"status\":\"{s}\"", .{status});
+        try writer.writeAll(",\"status\":\"");
+        try writeJsonString(writer, status);
+        try writer.writeAll("\"");
 
         if (session.pid) |pid| {
             try writer.print(",\"pid\":{d}", .{pid});
@@ -192,7 +223,9 @@ pub fn writeJson(
 
         var age_buf: [32]u8 = undefined;
         const age = formatAge(&age_buf, session.created_at);
-        try writer.print(",\"age\":\"{s}\"", .{age});
+        try writer.writeAll(",\"age\":\"");
+        try writeJsonString(writer, age);
+        try writer.writeAll("\"");
 
         const is_current = if (current_session) |current|
             std.mem.eql(u8, current, session.name)
@@ -201,24 +234,14 @@ pub fn writeJson(
         try writer.print(",\"is_current\":{}", .{is_current});
 
         if (session.cwd) |cwd| {
-            try writer.print(",\"start_dir\":\"{s}\"", .{cwd});
+            try writer.writeAll(",\"start_dir\":\"");
+            try writeJsonString(writer, cwd);
+            try writer.writeAll("\"");
         }
 
         if (session.cmd) |cmd| {
             try writer.writeAll(",\"cmd\":\"");
-            for (cmd) |c| {
-                switch (c) {
-                    '"' => try writer.writeAll("\\\""),
-                    '\\' => try writer.writeAll("\\\\"),
-                    '\n' => try writer.writeAll("\\n"),
-                    '\r' => try writer.writeAll("\\r"),
-                    '\t' => try writer.writeAll("\\t"),
-                    else => {
-                        const buf: [1]u8 = .{c};
-                        try writer.writeAll(&buf);
-                    },
-                }
-            }
+            try writeJsonString(writer, cmd);
             try writer.writeAll("\"");
         }
 
@@ -365,7 +388,7 @@ test "writeTable: produces formatted output" {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
-    try writeTable(&builder.writer, &sessions, null, alloc);
+    try writeTable(&builder.writer, &sessions, null, alloc, false);
     const output = builder.writer.buffered();
 
     // Should contain header and session name
@@ -375,4 +398,49 @@ test "writeTable: produces formatted output" {
     try std.testing.expect(std.mem.indexOf(u8, output, "CMD") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "dev") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "running") != null);
+}
+
+test "writeJsonString: escapes special characters" {
+    const alloc = std.testing.allocator;
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    try writeJsonString(&builder.writer, "hello\"world");
+    try std.testing.expectEqualStrings("hello\\\"world", builder.writer.buffered());
+}
+
+test "writeJsonString: escapes control characters" {
+    const alloc = std.testing.allocator;
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // ASCII 0x01 should become \u0001
+    try writeJsonString(&builder.writer, "a\x01b");
+    try std.testing.expectEqualStrings("a\\u0001b", builder.writer.buffered());
+}
+
+test "writeJson: escapes quotes in session name" {
+    const alloc = std.testing.allocator;
+    const sessions = [_]SessionEntry{
+        .{
+            .name = "test\"name",
+            .pid = 1,
+            .clients_len = 0,
+            .is_error = false,
+            .error_name = null,
+            .cmd = null,
+            .cwd = null,
+            .created_at = 0,
+            .task_ended_at = null,
+            .task_exit_code = null,
+        },
+    };
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    try writeJson(&builder.writer, &sessions, null);
+    const output = builder.writer.buffered();
+    // Name should be properly escaped
+    try std.testing.expect(std.mem.indexOf(u8, output, "test\\\"name") != null);
 }
