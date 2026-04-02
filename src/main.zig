@@ -8,6 +8,7 @@ const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
+const list_mod = @import("list.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 
@@ -102,6 +103,7 @@ const main_parsers = .{
 const list_params = clap.parseParamsComptime(
     \\-h, --help    Display this help message
     \\    --short   Use short output format
+    \\    --json    Output as JSON
     \\
 );
 
@@ -240,7 +242,7 @@ pub fn main() !void {
     if (res.args.help != 0) return help();
     if (res.args.version != 0) return printVersion(&cfg);
 
-    const command = res.positionals[0] orelse return list(&cfg, false);
+    const command = res.positionals[0] orelse return list(&cfg, .table);
 
     switch (command) {
         .help => return help(),
@@ -264,9 +266,15 @@ pub fn main() !void {
             defer list_res.deinit();
 
             if (list_res.args.help != 0) {
-                return subcommandUsage("list", "[--short]", "List active sessions");
+                return subcommandUsage("list", "[--short] [--json]", "List active sessions");
             }
-            return list(&cfg, list_res.args.short != 0);
+            const mode: list_mod.Mode = if (list_res.args.json != 0)
+                .json
+            else if (list_res.args.short != 0)
+                .short
+            else
+                .table;
+            return list(&cfg, mode);
         },
 
         .completions => {
@@ -1324,7 +1332,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
     }
 }
 
-fn list(cfg: *Cfg, short: bool) !void {
+fn list(cfg: *Cfg, mode: list_mod.Mode) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1334,7 +1342,7 @@ fn list(cfg: *Cfg, short: bool) !void {
         else => return err,
     };
     defer if (current_session) |name| alloc.free(name);
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
 
     var sessions = try util.get_session_entries(alloc, cfg.socket_dir);
@@ -1346,19 +1354,41 @@ fn list(cfg: *Cfg, short: bool) !void {
     }
 
     if (sessions.items.len == 0) {
-        if (short) return;
-        var errbuf: [4096]u8 = undefined;
-        var stderr = std.fs.File.stderr().writer(&errbuf);
-        try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
-        try stderr.interface.flush();
-        return;
+        switch (mode) {
+            .short => return,
+            .json => {
+                try stdout.interface.writeAll("[]\n");
+                try stdout.interface.flush();
+                return;
+            },
+            .table => {
+                var errbuf: [4096]u8 = undefined;
+                var stderr = std.fs.File.stderr().writer(&errbuf);
+                try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
+                try stderr.interface.flush();
+                return;
+            },
+        }
     }
 
     std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
 
-    for (sessions.items) |session| {
-        try util.writeSessionLine(&stdout.interface, session, short, current_session);
-        try stdout.interface.flush();
+    switch (mode) {
+        .short => {
+            for (sessions.items) |session| {
+                if (session.is_error) continue;
+                try stdout.interface.print("{s}\n", .{session.name});
+                try stdout.interface.flush();
+            }
+        },
+        .json => {
+            try list_mod.writeJson(&stdout.interface, sessions.items, current_session);
+            try stdout.interface.flush();
+        },
+        .table => {
+            try list_mod.writeTable(&stdout.interface, sessions.items, current_session, alloc);
+            try stdout.interface.flush();
+        },
     }
 }
 

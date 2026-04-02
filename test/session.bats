@@ -57,8 +57,8 @@ load test_helper
   run "$ZMX" list
   [ "$status" -eq 0 ]
   [[ "$output" == *"test-list"* ]]
-  [[ "$output" == *"pid="* ]]
-  [[ "$output" == *"cmd=echo hello"* ]]
+  [[ "$output" == *"NAME"* ]]
+  [[ "$output" == *"echo hello"* ]]
 }
 
 @test "list --short: shows only session names" {
