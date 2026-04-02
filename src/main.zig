@@ -778,6 +778,26 @@ const Daemon = struct {
                     }
                     if (devnull > 2) posix.close(devnull);
                 }
+
+                // Close file descriptors inherited from the parent that the
+                // daemon doesn't need. This prevents test harnesses (like
+                // bats) from hanging — they wait for their internal FDs (3+)
+                // to close before exiting.
+                //
+                // Must run BEFORE log_system.init() — otherwise the new log
+                // FD gets closed, and spawnPty() reuses that FD number for
+                // the PTY master, causing log writes to leak into the terminal.
+                //
+                // Skip server_sock_fd (needed for IPC) and dir.fd (needed to
+                // delete the socket file on shutdown).
+                {
+                    const dir_fd = @as(i32, @intCast(dir.fd));
+                    var fd: i32 = 3;
+                    while (fd < 64) : (fd += 1) {
+                        if (fd == server_sock_fd or fd == dir_fd) continue;
+                        _ = std.c.close(fd);
+                    }
+                }
                 const session_log_name = try std.fmt.allocPrint(
                     self.alloc,
                     "{s}.log",
@@ -790,23 +810,6 @@ const Daemon = struct {
                 );
                 defer self.alloc.free(session_log_path);
                 try log_system.init(self.alloc, session_log_path);
-
-                // Close file descriptors inherited from the parent that the
-                // daemon doesn't need. This prevents test harnesses (like
-                // bats) from hanging — they wait for their internal FDs (3+)
-                // to close before exiting. We close FDs 3..server_sock_fd
-                // (the parent's log FD lived here, now safely deinited) and
-                // anything above server_sock_fd up to a reasonable limit.
-                {
-                    var fd: i32 = 3;
-                    while (fd < server_sock_fd) : (fd += 1) {
-                        _ = std.c.close(fd);
-                    }
-                    fd = server_sock_fd + 1;
-                    while (fd < 64) : (fd += 1) {
-                        _ = std.c.close(fd);
-                    }
-                }
 
                 // If spawnPty fails, clean up here. Once it succeeds,
                 // the inner block's defer takes ownership of cleanup to
