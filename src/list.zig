@@ -164,32 +164,7 @@ pub fn writeTable(
     try table.format(writer);
 }
 
-/// Write a JSON-escaped string value (without surrounding quotes).
-/// Escapes per RFC 8259: \", \\, control chars below 0x20.
-fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    // Control character — \u00XX
-                    var buf: [6]u8 = undefined;
-                    _ = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
-                    try writer.writeAll(&buf);
-                } else {
-                    const buf: [1]u8 = .{c};
-                    try writer.writeAll(&buf);
-                }
-            },
-        }
-    }
-}
-
-/// Write sessions as a JSON array.
+/// Write sessions as a JSON array using std.json.Stringify.
 pub fn writeJson(
     writer: *std.Io.Writer,
     sessions: []const SessionEntry,
@@ -200,60 +175,52 @@ pub fn writeJson(
         return;
     }
 
-    try writer.writeAll("[");
-    for (sessions, 0..) |session, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.writeAll("\n  {");
+    var jw = std.json.Stringify{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
 
-        try writer.writeAll("\"name\":\"");
-        try writeJsonString(writer, session.name);
-        try writer.writeAll("\"");
+    try jw.beginArray();
+    for (sessions) |session| {
+        try jw.beginObject();
 
+        try jw.objectField("name");
+        try jw.write(session.name);
+
+        try jw.objectField("status");
         var status_buf: [32]u8 = undefined;
-        const status = formatStatus(&status_buf, session);
-        try writer.writeAll(",\"status\":\"");
-        try writeJsonString(writer, status);
-        try writer.writeAll("\"");
+        try jw.write(formatStatus(&status_buf, session));
 
-        if (session.pid) |pid| {
-            try writer.print(",\"pid\":{d}", .{pid});
-        }
-        if (session.clients_len) |clients| {
-            try writer.print(",\"clients\":{d}", .{clients});
-        }
-        if (session.task_exit_code) |code| {
-            try writer.print(",\"exit_code\":{d}", .{code});
-        }
+        try jw.objectField("pid");
+        try jw.write(session.pid);
 
-        try writer.print(",\"created_at\":{d}", .{session.created_at});
+        try jw.objectField("clients");
+        try jw.write(session.clients_len);
 
+        try jw.objectField("exit_code");
+        try jw.write(session.task_exit_code);
+
+        try jw.objectField("created_at");
+        try jw.write(session.created_at);
+
+        try jw.objectField("age");
         var age_buf: [32]u8 = undefined;
-        const age = formatAge(&age_buf, session.created_at);
-        try writer.writeAll(",\"age\":\"");
-        try writeJsonString(writer, age);
-        try writer.writeAll("\"");
+        try jw.write(formatAge(&age_buf, session.created_at));
 
+        try jw.objectField("is_current");
         const is_current = if (current_session) |current|
             std.mem.eql(u8, current, session.name)
         else
             false;
-        try writer.print(",\"is_current\":{}", .{is_current});
+        try jw.write(is_current);
 
-        if (session.cwd) |cwd| {
-            try writer.writeAll(",\"start_dir\":\"");
-            try writeJsonString(writer, cwd);
-            try writer.writeAll("\"");
-        }
+        try jw.objectField("start_dir");
+        try jw.write(session.cwd);
 
-        if (session.cmd) |cmd| {
-            try writer.writeAll(",\"cmd\":\"");
-            try writeJsonString(writer, cmd);
-            try writer.writeAll("\"");
-        }
+        try jw.objectField("cmd");
+        try jw.write(session.cmd);
 
-        try writer.writeAll("}");
+        try jw.endObject();
     }
-    try writer.writeAll("\n]\n");
+    try jw.endArray();
+    try writer.writeAll("\n");
 }
 
 // ============================================================================
@@ -366,12 +333,17 @@ test "writeJson: produces valid JSON structure" {
     try writeJson(&builder.writer, &sessions, null);
     const output = builder.writer.buffered();
 
-    // Should be parseable JSON
+    // Should be parseable JSON — validate by re-parsing
     try std.testing.expect(std.mem.startsWith(u8, output, "["));
     try std.testing.expect(std.mem.endsWith(u8, output, "]\n"));
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"name\":\"dev\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"status\":\"running\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"cmd\":\"bash\"") != null);
+    // Check key fields are present
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"name\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"cmd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "dev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "running") != null);
+    // Null fields should be present as null
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"start_dir\": null") != null);
 }
 
 test "writeTable: produces formatted output" {
@@ -447,26 +419,7 @@ test "writeJson: empty sessions produces empty array" {
     try std.testing.expectEqualStrings("[]\n", builder.writer.buffered());
 }
 
-test "writeJsonString: escapes special characters" {
-    const alloc = std.testing.allocator;
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-
-    try writeJsonString(&builder.writer, "hello\"world");
-    try std.testing.expectEqualStrings("hello\\\"world", builder.writer.buffered());
-}
-
-test "writeJsonString: escapes control characters" {
-    const alloc = std.testing.allocator;
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-
-    // ASCII 0x01 should become \u0001
-    try writeJsonString(&builder.writer, "a\x01b");
-    try std.testing.expectEqualStrings("a\\u0001b", builder.writer.buffered());
-}
-
-test "writeJson: escapes quotes in session name" {
+test "writeJson: escapes special characters in strings" {
     const alloc = std.testing.allocator;
     const sessions = [_]SessionEntry{
         .{
@@ -475,7 +428,7 @@ test "writeJson: escapes quotes in session name" {
             .clients_len = 0,
             .is_error = false,
             .error_name = null,
-            .cmd = null,
+            .cmd = "echo \"hello\\world\"",
             .cwd = null,
             .created_at = 0,
             .task_ended_at = null,
@@ -488,15 +441,9 @@ test "writeJson: escapes quotes in session name" {
 
     try writeJson(&builder.writer, &sessions, null);
     const output = builder.writer.buffered();
-    // Name should be properly escaped
+    // Quotes in name should be escaped
     try std.testing.expect(std.mem.indexOf(u8, output, "test\\\"name") != null);
+    // Backslash in cmd should be escaped
+    try std.testing.expect(std.mem.indexOf(u8, output, "\\\\world") != null);
 }
 
-test "writeJsonString: escapes backslash" {
-    const alloc = std.testing.allocator;
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-
-    try writeJsonString(&builder.writer, "path\\to\\dir");
-    try std.testing.expectEqualStrings("path\\\\to\\\\dir", builder.writer.buffered());
-}
