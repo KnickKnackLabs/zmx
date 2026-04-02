@@ -1,7 +1,6 @@
 const std = @import("std");
 const zigcli = @import("zigcli");
 const pretty_table = zigcli.pretty_table;
-const term = zigcli.term;
 const util = @import("util.zig");
 
 pub const SessionEntry = util.SessionEntry;
@@ -14,7 +13,9 @@ pub const Mode = enum {
 };
 
 /// Format an epoch timestamp as a human-readable relative age string.
-/// Returns a slice into `buf` like "2h ago", "3d ago", "just now".
+/// Returns either a comptime string literal (e.g. "just now") or a slice into
+/// `buf` (e.g. "2h ago", "3d ago"). The caller should not inspect `buf`
+/// directly — always use the returned slice.
 pub fn formatAge(buf: []u8, created_at: u64) []const u8 {
     const now: i64 = std.time.timestamp();
     const created: i64 = @intCast(created_at);
@@ -194,6 +195,11 @@ pub fn writeJson(
     sessions: []const SessionEntry,
     current_session: ?[]const u8,
 ) !void {
+    if (sessions.len == 0) {
+        try writer.writeAll("[]\n");
+        return;
+    }
+
     try writer.writeAll("[");
     for (sessions, 0..) |session, i| {
         if (i > 0) try writer.writeAll(",");
@@ -398,6 +404,47 @@ test "writeTable: produces formatted output" {
     try std.testing.expect(std.mem.indexOf(u8, output, "CMD") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "dev") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "running") != null);
+    // No ANSI escape codes in no-color mode
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+}
+
+test "writeTable: ANSI output with color enabled" {
+    const alloc = std.testing.allocator;
+    const sessions = [_]SessionEntry{
+        .{
+            .name = "dev",
+            .pid = 123,
+            .clients_len = 2,
+            .is_error = false,
+            .error_name = null,
+            .cmd = "bash",
+            .cwd = null,
+            .created_at = 1000,
+            .task_ended_at = null,
+            .task_exit_code = null,
+        },
+    };
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    try writeTable(&builder.writer, &sessions, null, alloc, true);
+    const output = builder.writer.buffered();
+
+    // Color mode should include ANSI escape codes
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "dev") != null);
+}
+
+test "writeJson: empty sessions produces empty array" {
+    const alloc = std.testing.allocator;
+    const sessions = [_]SessionEntry{};
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    try writeJson(&builder.writer, &sessions, null);
+    try std.testing.expectEqualStrings("[]\n", builder.writer.buffered());
 }
 
 test "writeJsonString: escapes special characters" {
@@ -443,4 +490,13 @@ test "writeJson: escapes quotes in session name" {
     const output = builder.writer.buffered();
     // Name should be properly escaped
     try std.testing.expect(std.mem.indexOf(u8, output, "test\\\"name") != null);
+}
+
+test "writeJsonString: escapes backslash" {
+    const alloc = std.testing.allocator;
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    try writeJsonString(&builder.writer, "path\\to\\dir");
+    try std.testing.expectEqualStrings("path\\\\to\\\\dir", builder.writer.buffered());
 }

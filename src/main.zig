@@ -268,6 +268,10 @@ pub fn main() !void {
             if (list_res.args.help != 0) {
                 return subcommandUsage("list", "[--short] [--json]", "List active sessions");
             }
+            if (list_res.args.json != 0 and list_res.args.short != 0) {
+                std.log.err("cannot use --json and --short together", .{});
+                return;
+            }
             const mode: list_mod.Mode = if (list_res.args.json != 0)
                 .json
             else if (list_res.args.short != 0)
@@ -1386,8 +1390,7 @@ fn list(cfg: *Cfg, mode: list_mod.Mode) !void {
             try stdout.interface.flush();
         },
         .table => {
-            const zigcli_term = @import("zigcli").term;
-            const use_color = zigcli_term.isTty(std.fs.File.stdout());
+            const use_color = std.posix.isatty(std.posix.STDOUT_FILENO);
             try list_mod.writeTable(&stdout.interface, sessions.items, current_session, alloc, use_color);
             try stdout.interface.flush();
         },
