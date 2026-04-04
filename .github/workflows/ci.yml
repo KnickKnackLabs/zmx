@@ -38,10 +38,10 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Install BATS
+      - name: Install BATS and dependencies
         run: |
           if command -v brew &>/dev/null; then
-            brew install bats-core
+            brew install bats-core coreutils
           else
             sudo apt-get update && sudo apt-get install -y bats
           fi
