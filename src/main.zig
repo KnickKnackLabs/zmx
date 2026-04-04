@@ -9,6 +9,7 @@ const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
 const list_mod = @import("list.zig");
+const output = @import("output.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 
@@ -240,13 +241,13 @@ pub fn main() !void {
     defer res.deinit();
 
     if (res.args.help != 0) return help();
-    if (res.args.version != 0) return printVersion(&cfg);
+    if (res.args.version != 0) return printVersion(alloc, &cfg);
 
     const command = res.positionals[0] orelse return list(&cfg, .table);
 
     switch (command) {
         .help => return help(),
-        .version => return printVersion(&cfg),
+        .version => return printVersion(alloc, &cfg),
         .detach => {
             if (isHelpFlag(args.next())) {
                 return subcommandUsage("detach", "", "Detach all clients from current session (ctrl+\\ for current client)");
@@ -432,10 +433,6 @@ pub fn main() !void {
 
             const force = kill_res.args.force != 0;
 
-            var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-            const stderr = &stderr_writer.interface;
-
             var args_raw: std.ArrayList([]const u8) = .empty;
             defer {
                 for (args_raw.items) |sesh| {
@@ -469,12 +466,10 @@ pub fn main() !void {
                         continue;
                     }
                     kill(&cfg, session.name, force) catch |err| {
-                        try stderr.print(
-                            "failed to kill session={s}: {s}\n",
-                            .{ session.name, @errorName(err) },
-                        );
-                        try stderr.flush();
+                        output.printError("kill {s}: {s}", .{ session.name, @errorName(err) }) catch {};
+                        break;
                     };
+                    output.printSuccess("killed {s}", .{session.name}) catch {};
                     break;
                 }
             }
@@ -495,10 +490,6 @@ pub fn main() !void {
             if (rm_res.args.help != 0) {
                 return subcommandUsage("rm", "<name>...", "Remove a session (kill if running, delete socket)");
             }
-
-            var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-            const stderr = &stderr_writer.interface;
 
             var args_raw: std.ArrayList([]const u8) = .empty;
             defer {
@@ -528,12 +519,10 @@ pub fn main() !void {
                 for (args_raw.items) |prefix| {
                     if (std.mem.startsWith(u8, session.name, prefix)) {
                         rmSession(&cfg, session.name) catch |err| {
-                            try stderr.print(
-                                "failed to remove session={s}: {s}\n",
-                                .{ session.name, @errorName(err) },
-                            );
-                            try stderr.flush();
+                            output.printError("rm {s}: {s}", .{ session.name, @errorName(err) }) catch {};
+                            break;
                         };
+                        output.printSuccess("removed {s}", .{session.name}) catch {};
                         break;
                     }
                 }
@@ -1126,9 +1115,9 @@ const Daemon = struct {
             std.meta.intToEnum(util.HistoryFormat, payload[0]) catch .plain
         else
             .plain;
-        if (util.serializeTerminal(self.alloc, term, format)) |output| {
-            defer self.alloc.free(output);
-            try ipc.appendMessage(self.alloc, &client.write_buf, .History, output);
+        if (util.serializeTerminal(self.alloc, term, format)) |serialized| {
+            defer self.alloc.free(serialized);
+            try ipc.appendMessage(self.alloc, &client.write_buf, .History, serialized);
             client.has_pending_output = true;
         } else {
             try ipc.appendMessage(self.alloc, &client.write_buf, .History, "");
@@ -1152,18 +1141,12 @@ const Daemon = struct {
     }
 };
 
-fn printVersion(cfg: *Cfg) !void {
-    var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+fn printVersion(alloc: std.mem.Allocator, cfg: *Cfg) !void {
     var ver = version;
     if (builtin.mode == .Debug) {
         ver = git_sha;
     }
-    try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
-        .{ ver, ghostty_version, cfg.socket_dir, cfg.log_dir },
-    );
-    try w.interface.flush();
+    try output.printVersionTable(alloc, ver, ghostty_version, cfg.socket_dir, cfg.log_dir);
 }
 
 fn printCompletions(shell: completions.Shell) !void {
