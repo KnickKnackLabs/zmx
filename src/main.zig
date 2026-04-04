@@ -1458,10 +1458,6 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
         else => return err,
     };
 
-    var buf: [100]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("killed session {s}\n", .{session_name});
-    try w.interface.flush();
 }
 
 fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
@@ -1523,10 +1519,6 @@ fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
         },
     };
 
-    var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("removed session {s}\n", .{session_name});
-    try w.interface.flush();
 }
 
 fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
