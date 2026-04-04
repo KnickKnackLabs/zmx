@@ -109,7 +109,6 @@ pub fn writeTable(
     alloc: std.mem.Allocator,
     use_color: bool,
 ) !void {
-
     var table = pretty_table.Table(4).Owned.init(.{
         .mode = .ascii,
         .padding = 1,
@@ -446,4 +445,3 @@ test "writeJson: escapes special characters in strings" {
     // Backslash in cmd should be escaped
     try std.testing.expect(std.mem.indexOf(u8, output, "\\\\world") != null);
 }
-
