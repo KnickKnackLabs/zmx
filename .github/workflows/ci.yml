@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Patch ghostty dependency
+        run: ./patch-ghostty-build.sh
+
+      - name: Check compilation
+        run: zig build check
+
+      - name: Check formatting
+        run: zig fmt --check src/
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Build
+        run: zig build
+
+      - name: Install BATS
+        uses: bats-core/bats-action@2.0.0
+
+      - name: BATS tests
+        run: bats test/
