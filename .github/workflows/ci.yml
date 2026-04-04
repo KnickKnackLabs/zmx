@@ -39,7 +39,12 @@ jobs:
         run: zig build
 
       - name: Install BATS
-        uses: bats-core/bats-action@2.0.0
+        run: |
+          if command -v brew &>/dev/null; then
+            brew install bats-core
+          else
+            sudo apt-get update && sudo apt-get install -y bats
+          fi
 
       - name: BATS tests
         run: bats test/
