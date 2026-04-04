@@ -9,6 +9,12 @@ setup() {
   fi
   ZMX="$REPO_DIR/zig-out/bin/zmx"
 
+  # macOS doesn't have GNU timeout; use gtimeout from coreutils if available
+  if ! command -v timeout &>/dev/null && command -v gtimeout &>/dev/null; then
+    timeout() { gtimeout "$@"; }
+    export -f timeout
+  fi
+
   # Isolate socket dir so tests don't interfere with real sessions or each other
   export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
   mkdir -p "$ZMX_DIR"

@@ -1429,7 +1429,6 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
-
 }
 
 fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
@@ -1487,7 +1486,6 @@ fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
             return err;
         },
     };
-
 }
 
 fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {

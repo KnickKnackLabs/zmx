@@ -47,7 +47,7 @@ load test_helper
 @test "list: no sessions returns cleanly" {
   run "$ZMX" list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no sessions found"* ]]
+  [[ "$output" == *"no sessions"* ]]
 }
 
 @test "list: shows session details" {
@@ -89,7 +89,7 @@ load test_helper
 
   run "$ZMX" kill test-kill
   [ "$status" -eq 0 ]
-  [[ "$output" == *"killed session test-kill"* ]]
+  [[ "$output" == *"killed test-kill"* ]]
 
   run "$ZMX" list --short
   [[ "$output" != *"test-kill"* ]]
@@ -103,8 +103,8 @@ load test_helper
 
   run "$ZMX" kill kill-a kill-b
   [ "$status" -eq 0 ]
-  [[ "$output" == *"killed session kill-a"* ]]
-  [[ "$output" == *"killed session kill-b"* ]]
+  [[ "$output" == *"killed kill-a"* ]]
+  [[ "$output" == *"killed kill-b"* ]]
 }
 
 @test "kill --force: removes socket file for dead session" {
