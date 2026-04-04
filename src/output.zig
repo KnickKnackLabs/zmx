@@ -31,6 +31,30 @@ pub fn printError(comptime fmt: []const u8, args: anytype) !void {
     try w.interface.flush();
 }
 
+/// Print an info/status message (dim prefix when color is enabled).
+pub fn printInfo(comptime fmt: []const u8, args: anytype) !void {
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    if (useColor()) {
+        try w.interface.print("\x1b[2m▸\x1b[0m " ++ fmt ++ "\n", args);
+    } else {
+        try w.interface.print("▸ " ++ fmt ++ "\n", args);
+    }
+    try w.interface.flush();
+}
+
+/// Print a warning message (yellow ⚠ when color is enabled).
+pub fn printWarn(comptime fmt: []const u8, args: anytype) !void {
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    if (useColor()) {
+        try w.interface.print("\x1b[33m⚠\x1b[0m " ++ fmt ++ "\n", args);
+    } else {
+        try w.interface.print("⚠ " ++ fmt ++ "\n", args);
+    }
+    try w.interface.flush();
+}
+
 /// Print version info as a styled table.
 pub fn printVersionTable(alloc: std.mem.Allocator, ver: []const u8, ghostty_ver: []const u8, socket_dir: []const u8, log_dir: []const u8) !void {
     const color = useColor();
