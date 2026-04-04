@@ -9,6 +9,7 @@ const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
 const list_mod = @import("list.zig");
+const output = @import("output.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 
@@ -230,7 +231,7 @@ pub fn main() !void {
         if (err == error.NameNotPartOfEnum) {
             // The user typed an unknown command. diag.arg isn't populated for
             // positional value-parse errors, so report generically.
-            stderr.print("Unknown command. Run 'zmx --help' for usage information.\n", .{}) catch {};
+            output.printError("unknown command — run 'zmx --help' for usage", .{}) catch {};
         } else {
             diag.reportToFile(.stderr(), err) catch {};
         }
@@ -240,13 +241,13 @@ pub fn main() !void {
     defer res.deinit();
 
     if (res.args.help != 0) return help();
-    if (res.args.version != 0) return printVersion(&cfg);
+    if (res.args.version != 0) return printVersion(alloc, &cfg);
 
     const command = res.positionals[0] orelse return list(&cfg, .table);
 
     switch (command) {
         .help => return help(),
-        .version => return printVersion(&cfg),
+        .version => return printVersion(alloc, &cfg),
         .detach => {
             if (isHelpFlag(args.next())) {
                 return subcommandUsage("detach", "", "Detach all clients from current session (ctrl+\\ for current client)");
@@ -432,10 +433,6 @@ pub fn main() !void {
 
             const force = kill_res.args.force != 0;
 
-            var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-            const stderr = &stderr_writer.interface;
-
             var args_raw: std.ArrayList([]const u8) = .empty;
             defer {
                 for (args_raw.items) |sesh| {
@@ -469,12 +466,10 @@ pub fn main() !void {
                         continue;
                     }
                     kill(&cfg, session.name, force) catch |err| {
-                        try stderr.print(
-                            "failed to kill session={s}: {s}\n",
-                            .{ session.name, @errorName(err) },
-                        );
-                        try stderr.flush();
+                        output.printError("kill {s}: {s}", .{ session.name, @errorName(err) }) catch {};
+                        break;
                     };
+                    output.printSuccess("killed {s}", .{session.name}) catch {};
                     break;
                 }
             }
@@ -495,10 +490,6 @@ pub fn main() !void {
             if (rm_res.args.help != 0) {
                 return subcommandUsage("rm", "<name>...", "Remove a session (kill if running, delete socket)");
             }
-
-            var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-            const stderr = &stderr_writer.interface;
 
             var args_raw: std.ArrayList([]const u8) = .empty;
             defer {
@@ -528,12 +519,10 @@ pub fn main() !void {
                 for (args_raw.items) |prefix| {
                     if (std.mem.startsWith(u8, session.name, prefix)) {
                         rmSession(&cfg, session.name) catch |err| {
-                            try stderr.print(
-                                "failed to remove session={s}: {s}\n",
-                                .{ session.name, @errorName(err) },
-                            );
-                            try stderr.flush();
+                            output.printError("rm {s}: {s}", .{ session.name, @errorName(err) }) catch {};
+                            break;
                         };
+                        output.printSuccess("removed {s}", .{session.name}) catch {};
                         break;
                     }
                 }
@@ -1126,9 +1115,9 @@ const Daemon = struct {
             std.meta.intToEnum(util.HistoryFormat, payload[0]) catch .plain
         else
             .plain;
-        if (util.serializeTerminal(self.alloc, term, format)) |output| {
-            defer self.alloc.free(output);
-            try ipc.appendMessage(self.alloc, &client.write_buf, .History, output);
+        if (util.serializeTerminal(self.alloc, term, format)) |serialized| {
+            defer self.alloc.free(serialized);
+            try ipc.appendMessage(self.alloc, &client.write_buf, .History, serialized);
             client.has_pending_output = true;
         } else {
             try ipc.appendMessage(self.alloc, &client.write_buf, .History, "");
@@ -1152,18 +1141,12 @@ const Daemon = struct {
     }
 };
 
-fn printVersion(cfg: *Cfg) !void {
-    var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+fn printVersion(alloc: std.mem.Allocator, cfg: *Cfg) !void {
     var ver = version;
     if (builtin.mode == .Debug) {
         ver = git_sha;
     }
-    try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
-        .{ ver, ghostty_version, cfg.socket_dir, cfg.log_dir },
-    );
-    try w.interface.flush();
+    try output.printVersionTable(alloc, ver, ghostty_version, cfg.socket_dir, cfg.log_dir);
 }
 
 fn printCompletions(shell: completions.Shell) !void {
@@ -1228,14 +1211,6 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-    const stderr = &stderr_writer.interface;
-
     // Highest match count seen so far. Lets us distinguish "sessions haven't
     // appeared yet" (keep polling) from "sessions we were tracking
     // disappeared" (fail -- daemon crashed or was killed).
@@ -1266,22 +1241,20 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
                 // is no longer deleted, so this session would otherwise
                 // persist as task_ended_at==0 forever → infinite "still
                 // waiting". Count it as done+failed so wait terminates.
-                try stderr.print(
-                    "task unreachable: {s} ({s})\n",
-                    .{ session.name, session.error_name orelse "unknown" },
-                );
-                try stderr.flush();
+                output.printError("{s}: unreachable ({s})", .{ session.name, session.error_name orelse "unknown" }) catch {};
                 agg_exit_code = 1;
                 done += 1;
                 continue;
             }
             if (session.task_ended_at == 0) {
-                try stdout.print("waiting task={s}\n", .{session.name});
-                try stdout.flush();
+                output.printInfo("waiting for {s}", .{session.name}) catch {};
                 continue;
             }
-            try stdout.print("completed task={s} exit_code={d}\n", .{ session.name, session.task_exit_code.? });
-            try stdout.flush();
+            if (session.task_exit_code == 0) {
+                output.printSuccess("{s} completed", .{session.name}) catch {};
+            } else {
+                output.printError("{s} exited ({d})", .{ session.name, session.task_exit_code.? }) catch {};
+            }
             if (session.task_exit_code != 0) {
                 agg_exit_code = session.task_exit_code orelse 0;
             }
@@ -1297,11 +1270,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
         // crashed and the remaining N-1 happen to be done, total==done
         // would be a false success.
         if (total < max_seen) {
-            try stderr.print(
-                "error: {d} session(s) disappeared before completing\n",
-                .{max_seen - total},
-            );
-            try stderr.flush();
+            output.printError("{d} session(s) disappeared before completing", .{max_seen - total}) catch {};
             std.process.exit(1);
             return;
         }
@@ -1309,11 +1278,10 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
 
         if (total > 0 and total == done) {
             if (agg_exit_code == 0) {
-                try stdout.print("task(s) completed!\n", .{});
+                output.printSuccess("all tasks completed", .{}) catch {};
             } else {
-                try stdout.print("task(s) failed!\n", .{});
+                output.printError("tasks failed", .{}) catch {};
             }
-            try stdout.flush();
             std.process.exit(agg_exit_code);
             return;
         }
@@ -1325,8 +1293,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
             // typo, not a slow start.
             zero_match_iters += 1;
             if (zero_match_iters >= 3) {
-                try stderr.print("error: no matching sessions found\n", .{});
-                try stderr.flush();
+                output.printError("no matching sessions found", .{}) catch {};
                 std.process.exit(2);
                 return;
             }
@@ -1366,10 +1333,7 @@ fn list(cfg: *Cfg, mode: list_mod.Mode) !void {
                 return;
             },
             .table => {
-                var errbuf: [4096]u8 = undefined;
-                var stderr = std.fs.File.stderr().writer(&errbuf);
-                try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
-                try stderr.interface.flush();
+                output.printInfo("no sessions", .{}) catch {};
                 return;
             },
         }
@@ -1446,26 +1410,17 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
+        output.printError("session \"{s}\" does not exist", .{session_name}) catch {};
         return error.SessionNotFound;
     }
     const result = ipc.probeSession(alloc, socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stdout().writer(&buf);
         if (force or err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(dir, session_name);
-            w.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
+            output.printSuccess("cleaned up stale session {s}", .{session_name}) catch {};
         } else {
-            w.interface.print(
-                "session {s} is unresponsive ({s})\ndaemon may be busy: try again, add `--force` flag, or kill the process directly\n",
-                .{ session_name, @errorName(err) },
-            ) catch {};
+            output.printWarn("{s} is unresponsive ({s}) — try again, use --force, or kill the process directly", .{ session_name, @errorName(err) }) catch {};
         }
-        w.interface.flush() catch {};
         return;
     };
 
@@ -1475,10 +1430,6 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
         else => return err,
     };
 
-    var buf: [100]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("killed session {s}\n", .{session_name});
-    try w.interface.flush();
 }
 
 fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
@@ -1497,10 +1448,7 @@ fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
+        output.printError("session \"{s}\" does not exist", .{session_name}) catch {};
         return error.SessionNotFound;
     }
 
@@ -1540,10 +1488,6 @@ fn rmSession(cfg: *Cfg, session_name: []const u8) !void {
         },
     };
 
-    var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("removed session {s}\n", .{session_name});
-    try w.interface.flush();
 }
 
 fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
@@ -1562,10 +1506,7 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
+        output.printError("session \"{s}\" does not exist", .{session_name}) catch {};
         return error.SessionNotFound;
     }
     const result = ipc.probeSession(alloc, socket_path) catch |err| {
@@ -1676,8 +1617,6 @@ fn attach(daemon: *Daemon) !void {
 
 fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     const alloc = daemon.alloc;
-    var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
 
     var cmd_to_send: ?[]const u8 = null;
     var allocated_cmd: ?[]u8 = null;
@@ -1687,8 +1626,7 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     if (result.is_daemon) return;
 
     if (result.created) {
-        try w.interface.print("session \"{s}\" created\n", .{daemon.session_name});
-        try w.interface.flush();
+        output.printSuccess("session \"{s}\" created", .{daemon.session_name}) catch {};
     }
 
     const shell = util.detectShell();
@@ -1796,8 +1734,7 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
 
     while (sb.next()) |msg| {
         if (msg.header.tag == .Ack) {
-            try w.interface.print("command sent\n", .{});
-            try w.interface.flush();
+            output.printSuccess("command sent", .{}) catch {};
             return;
         }
     }

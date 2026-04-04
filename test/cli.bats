@@ -10,8 +10,8 @@ load test_helper
 @test "no args: defaults to list" {
   run "$ZMX"
   [ "$status" -eq 0 ]
-  # No sessions in our isolated dir, so expect "no sessions found"
-  [[ "$output" == *"no sessions found"* ]]
+  # No sessions in our isolated dir, so expect "no sessions" info message
+  [[ "$output" == *"no sessions"* ]]
 }
 
 @test "--help: shows usage" {
@@ -156,7 +156,7 @@ load test_helper
 @test "unknown command: reports error and exits non-zero" {
   run "$ZMX" foo
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Unknown command"* ]]
+  [[ "$output" == *"unknown command"* ]]
   [[ "$output" == *"--help"* ]]
 }
 
