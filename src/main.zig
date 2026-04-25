@@ -693,6 +693,8 @@ const Daemon = struct {
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     task_command: ?[]const []const u8 = null,
+    is_fish: bool = false, // true if the session's foreground shell is fish
+    pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *Daemon) void {
@@ -1181,7 +1183,37 @@ const Daemon = struct {
         self.task_ended_at = null;
         self.is_task_mode = true;
 
-        self.queuePtyInput(payload);
+        if (payload.len == 0) return;
+
+        // Auto-detect the foreground process on the PTY so we can pick the
+        // right shell syntax for the task-completion marker. Replaces the
+        // old client-side SHELL-env heuristic (upstream 758a137).
+        if (self.pty_fd >= 0) {
+            var name_buf: [64]u8 = undefined;
+            if (cross.getForegroundProcessName(self.pty_fd, &name_buf)) |name| {
+                self.is_fish = std.mem.eql(u8, name, "fish");
+                std.log.debug("foreground process={s} is_fish={}", .{ name, self.is_fish });
+            }
+        }
+
+        // Daemon appends the task marker so the client never injects
+        // shell-specific syntax, keeping Ctrl-C recovery clean.
+        const marker = if (self.is_fish)
+            "; echo ZMX_TASK_COMPLETED:$status"
+        else
+            "; echo ZMX_TASK_COMPLETED:$?";
+
+        // Payload may already end with \r (client convention). Strip it so
+        // we append marker before the CR that submits to readline.
+        const cmd = payload;
+        if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
+            self.queuePtyInput(cmd[0 .. cmd.len - 1]);
+        } else {
+            self.queuePtyInput(cmd);
+        }
+        self.queuePtyInput(marker);
+        self.queuePtyInput("\r");
+
         try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
         self.has_had_client = true;
@@ -1675,20 +1707,9 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
         output.printSuccess("session \"{s}\" created", .{daemon.session_name}) catch {};
     }
 
-    const shell = util.detectShell();
-    const shell_basename = std.fs.path.basename(shell);
-    // We append a task marker so we can:
-    //   - know when the command finishes
-    //   - capture its exit status
-    // This information is retrived when running `zmx list`
-    const inline_task_marker = if (std.mem.eql(u8, shell_basename, "fish"))
-        "; echo ZMX_TASK_COMPLETED:$status"
-    else
-        "; echo ZMX_TASK_COMPLETED:$?";
-    const stdin_task_marker = if (std.mem.eql(u8, shell_basename, "fish"))
-        "echo ZMX_TASK_COMPLETED:$status"
-    else
-        "echo ZMX_TASK_COMPLETED:$?";
+    // The daemon detects the running shell and appends the task-completion
+    // marker server-side (see Daemon.handleRun). Client just sends the
+    // raw command bytes.
 
     if (command_args.len > 0) {
         var cmd_list = std.ArrayList(u8).empty;
@@ -1704,13 +1725,6 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
                 try cmd_list.appendSlice(alloc, arg);
             }
         }
-
-        try cmd_list.appendSlice(alloc, inline_task_marker);
-        // \r, not \n: once the shell is at the readline prompt the PTY is in
-        // raw mode; readline's accept-line binds to CR. The first-ever run
-        // works with \n only because it arrives during shell startup while
-        // the line discipline is still canonical.
-        try cmd_list.append(alloc, '\r');
 
         cmd_to_send = try cmd_list.toOwnedSlice(alloc);
         allocated_cmd = @constCast(cmd_to_send.?);
@@ -1730,18 +1744,17 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
                 try stdin_buf.appendSlice(alloc, tmp[0..n]);
             }
 
+            // Strip a trailing newline — the daemon appends \r after the
+            // marker. This keeps the "last line" of piped input from
+            // getting split across the marker.
+            if (stdin_buf.items.len > 0 and
+                (stdin_buf.items[stdin_buf.items.len - 1] == '\n' or
+                 stdin_buf.items[stdin_buf.items.len - 1] == '\r'))
+            {
+                _ = stdin_buf.pop();
+            }
+
             if (stdin_buf.items.len > 0) {
-                // Normalize any trailing newline to CR so readline (raw mode)
-                // accepts each line.
-                if (stdin_buf.items[stdin_buf.items.len - 1] == '\n') {
-                    stdin_buf.items[stdin_buf.items.len - 1] = '\r';
-                } else {
-                    try stdin_buf.append(alloc, '\r');
-                }
-
-                try stdin_buf.appendSlice(alloc, stdin_task_marker);
-                try stdin_buf.append(alloc, '\r');
-
                 cmd_to_send = try alloc.dupe(u8, stdin_buf.items);
                 allocated_cmd = @constCast(cmd_to_send.?);
             }
@@ -1953,6 +1966,7 @@ fn clientLoop(client_sock_fd: i32) !void {
 /// clients.  It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
+    daemon.pty_fd = pty_fd;
     setupSigtermHandler();
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(daemon.alloc, 8);
     defer poll_fds.deinit(daemon.alloc);
