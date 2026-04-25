@@ -378,13 +378,20 @@ pub fn main() !void {
         .run => {
             const first_arg = args.next();
             if (isHelpFlag(first_arg)) {
-                return subcommandUsage("run", "<name> [command...]", "Send command without attaching, creating session if needed");
+                return subcommandUsage("run", "<name> [-d] [command...]", "Send command without attaching, creating session if needed");
             }
             const session_name = first_arg orelse "";
 
             var cmd_args_raw: std.ArrayList([]const u8) = .empty;
             defer cmd_args_raw.deinit(alloc);
+            // Recognize -d / --detach anywhere after the session name.
+            // KKL's `run` is already non-blocking (ack-then-return), so
+            // the flag is accepted for compatibility with upstream and
+            // the bats integration suite but does not change behavior.
             while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+                    continue;
+                }
                 try cmd_args_raw.append(alloc, arg);
             }
             const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
