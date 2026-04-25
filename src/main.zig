@@ -1345,6 +1345,30 @@ const Daemon = struct {
         }
     }
 
+    /// Relay a .Switch message to the current leader client so the
+    /// clientLoop can break out and attach to a different session.
+    /// Upstream 43e6f0f.
+    pub fn handleSwitch(self: *Daemon, session_name: []const u8) !void {
+        for (self.clients.items) |client| {
+            if (self.leader_client_fd == client.socket_fd) {
+                ipc.appendMessage(
+                    self.alloc,
+                    &client.write_buf,
+                    .Switch,
+                    session_name,
+                ) catch |err| {
+                    std.log.warn(
+                        "failed to buffer switch for client err={s}",
+                        .{@errorName(err)},
+                    );
+                };
+                client.has_pending_output = true;
+                return;
+            }
+        }
+        return error.NoLeaderFound;
+    }
+
     pub fn handleOutput(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
         try vt_stream.nextSlice(payload);
         self.has_pty_output = true;
@@ -1857,10 +1881,50 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     }
 }
 
+/// Request that a running session hand off to a different session.
+/// Called when `zmx attach <name>` runs inside a session (ZMX_SESSION
+/// env set): we tell the *current* daemon to relay a .Switch IPC to
+/// its leader, which bubbles up to the client via clientLoop and
+/// triggers a recursive attach to the target session.
+fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
+    // daemon.session_name is the target the user asked for; current_sesh
+    // is the session we're currently attached inside of.
+    const next_session = daemon.session_name;
+
+    const socket_path = socket.getSocketPath(daemon.alloc, daemon.cfg.socket_dir, current_sesh) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(current_sesh, daemon.cfg.socket_dir),
+        error.OutOfMemory => return err,
+    };
+    defer daemon.alloc.free(socket_path);
+
+    var dir = try std.fs.openDirAbsolute(daemon.cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, current_sesh);
+    if (!exists) {
+        output.printError("session \"{s}\" does not exist", .{current_sesh}) catch {};
+        return error.SessionNotFound;
+    }
+    const result = ipc.probeSession(daemon.alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, current_sesh);
+        return;
+    };
+    defer posix.close(result.fd);
+
+    ipc.send(result.fd, .Switch, next_session) catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return,
+        else => return err,
+    };
+}
+
 fn attach(daemon: *Daemon) !void {
-    const sesh = socket.getSeshNameFromEnv();
-    if (sesh.len > 0) {
-        return error.CannotAttachToSessionInSession;
+    // If ZMX_SESSION is set we're already inside a session. Ask the current
+    // session's daemon to relay .Switch so the client loop can bounce us
+    // into the target (upstream 43e6f0f).
+    const current = socket.getSeshNameFromEnv();
+    if (current.len > 0) {
+        return switchSesh(daemon, current);
     }
 
     const result = try daemon.ensureSession();
@@ -1924,7 +1988,41 @@ fn attach(daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
-    try clientLoop(client_sock);
+    const looper = try clientLoop(client_sock);
+    switch (looper.kind) {
+        .detach => return,
+        .switch_session => {
+            if (looper.session_name) |session_name| {
+                var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const cwd = std.posix.getcwd(&cwd_buf) catch "";
+                const target_path = socket.getSocketPath(
+                    daemon.alloc,
+                    daemon.cfg.socket_dir,
+                    session_name,
+                ) catch |err| switch (err) {
+                    error.NameTooLong => return socket.printSessionNameTooLong(
+                        session_name,
+                        daemon.cfg.socket_dir,
+                    ),
+                    error.OutOfMemory => return err,
+                };
+
+                const clients = try std.ArrayList(*Client).initCapacity(daemon.alloc, 10);
+                var target_daemon = Daemon{
+                    .running = true,
+                    .cfg = daemon.cfg,
+                    .alloc = daemon.alloc,
+                    .clients = clients,
+                    .session_name = session_name,
+                    .socket_path = target_path,
+                    .pid = undefined,
+                    .cwd = cwd,
+                    .created_at = @intCast(std.time.timestamp()),
+                };
+                return attach(&target_daemon);
+            }
+        },
+    }
 }
 
 /// Send raw bytes to a session's PTY. Tag selects semantics:
@@ -2244,7 +2342,15 @@ fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32) !void {
+const ClientResult = struct {
+    kind: enum {
+        detach,
+        switch_session,
+    },
+    session_name: ?[]const u8,
+};
+
+fn clientLoop(client_sock_fd: i32) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2340,7 +2446,7 @@ fn clientLoop(client_sock_fd: i32) !void {
                     }
                 } else {
                     // EOF on stdin
-                    return;
+                    return ClientResult{ .kind = .detach, .session_name = null };
                 }
             }
         }
@@ -2350,13 +2456,13 @@ fn clientLoop(client_sock_fd: i32) !void {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                    return;
+                    return ClientResult{ .kind = .detach, .session_name = null };
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
                 return err;
             };
             if (n == 0) {
-                return; // Server closed connection
+                return ClientResult{ .kind = .detach, .session_name = null };
             }
 
             while (read_buf.next()) |msg| {
@@ -2365,6 +2471,14 @@ fn clientLoop(client_sock_fd: i32) !void {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(alloc, msg.payload);
                         }
+                    },
+                    .Switch => {
+                        // Daemon tells us to switch sessions. Payload is the
+                        // target session name.
+                        return ClientResult{
+                            .kind = .switch_session,
+                            .session_name = try alloc.dupe(u8, msg.payload),
+                        };
                     },
                     else => {},
                 }
@@ -2377,7 +2491,7 @@ fn clientLoop(client_sock_fd: i32) !void {
                 const n = posix.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                        return;
+                        return ClientResult{ .kind = .detach, .session_name = null };
                     }
                     return err;
                 };
@@ -2398,7 +2512,7 @@ fn clientLoop(client_sock_fd: i32) !void {
         }
 
         if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-            return;
+            return ClientResult{ .kind = .detach, .session_name = null };
         }
     }
 }
@@ -2629,7 +2743,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, msg.payload),
                         .Write => try daemon.handleWrite(client, msg.payload),
-                        .Ack, .Switch, .TaskComplete => {},
+                        .Switch => try daemon.handleSwitch(msg.payload),
+                        .Ack, .TaskComplete => {},
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
