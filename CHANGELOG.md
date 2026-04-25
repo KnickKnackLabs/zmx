@@ -4,15 +4,33 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+## v0.5.0 - 2026-04-16
+
+### Added
+
+- New client leader policy: last client to send user input bytes (non-ansi escape codes) becomes the leader
+  - The client leader controls resizing and any other terminal state changes
+  - Non-leader clients are read-only until they send user input bytes and takeover leadership
+  - When a leader is promoted we immediately resize to their window size
+- `zmx attach` now lets users switch to another session from within a session
+- `zmx tail` will receive all outout from sessions in read-only mode
+- `zmx write` will pipe data from stdin, convert to base64, chunk, and send data through pty to write to a file
+
 ### Changed
 
+- *BREAKING* `zmx run` is now synchonous by default and tails the session
+  - Use detached mode (`-d`) for previous behavior
+- *BREAKING* `kill` and `wait` now require "\*" suffix for wildcard match sessions
+  - e.g. `zmx kill "d.*"`, `zmx kill "*"`, `zmx wait "test*"`
+- `zmx run` accepts `--fish` flag to indicate the session's shell is fish
 - `zmx kill` now supports multiple args and it will kill sessions that match a prefix
-  - e.g. `zmx kill d.` will kill all sessions that match that prefix
+  - e.g. `zmx kill "d.*"` will kill all sessions that match that prefix
 
 ### Fixed
 
 - `zmx list` will send "no sessions found" to stderr instead of stdout
 - `zmx wait` will send errors to stderr instead of stdout
+- Rewrite OSC `133;A` with `redraw=0` to prevent prompt loss on resize
 
 ## v0.4.2 - 2026-03-18
 
