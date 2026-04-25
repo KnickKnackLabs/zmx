@@ -72,6 +72,7 @@ const Command = enum {
     send,
     print,
     write,
+    control,
     tail,
     detach,
     list,
@@ -97,6 +98,7 @@ fn parseCommand(in: []const u8) error{NameNotPartOfEnum}!Command {
         .{ "p", Command.print },
         .{ "write", Command.write },
         .{ "wr", Command.write },
+        .{ "control", Command.control },
         .{ "tail", Command.tail },
         .{ "t", Command.tail },
         .{ "detach", Command.detach },
@@ -195,6 +197,7 @@ test "parseCommand — full names" {
     try std.testing.expectEqual(Command.completions, try parseCommand("completions"));
     try std.testing.expectEqual(Command.kill, try parseCommand("kill"));
     try std.testing.expectEqual(Command.rm, try parseCommand("rm"));
+    try std.testing.expectEqual(Command.control, try parseCommand("control"));
     try std.testing.expectEqual(Command.history, try parseCommand("history"));
     try std.testing.expectEqual(Command.wait, try parseCommand("wait"));
     try std.testing.expectEqual(Command.version, try parseCommand("version"));
@@ -379,6 +382,47 @@ pub fn main() !void {
             const sesh = try socket.getSeshName(alloc, hist_res.positionals[0] orelse sesh_env);
             defer alloc.free(sesh);
             return history(&cfg, sesh, format);
+        },
+
+        .control => {
+            var control_args: std.ArrayList([]const u8) = .empty;
+            defer control_args.deinit(alloc);
+            while (args.next()) |arg| {
+                try control_args.append(alloc, arg);
+            }
+
+            const parsed = try parseControlArgs(control_args.items);
+            if (parsed.probe) {
+                return printControlProbe();
+            }
+
+            const session_name = parsed.session_name orelse return error.SessionNameRequired;
+            const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+            const control_command: ?[][]const u8 = if (parsed.command_args.len > 0) @constCast(parsed.command_args) else null;
+
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
+            const sesh = try socket.getSeshName(alloc, session_name);
+            defer alloc.free(sesh);
+            var daemon = Daemon{
+                .running = true,
+                .cfg = &cfg,
+                .alloc = alloc,
+                .clients = clients,
+                .session_name = sesh,
+                .socket_path = undefined,
+                .pid = undefined,
+                .command = control_command,
+                .cwd = cwd,
+                .created_at = @intCast(std.time.timestamp()),
+            };
+            daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+                error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+                error.OutOfMemory => return err,
+            };
+            std.log.info("control session={s} protocol={s} socket path={s}", .{ daemon.session_name, parsed.protocol, daemon.socket_path });
+            return control(&daemon, parsed.rows, parsed.cols);
         },
 
         .attach => {
@@ -1537,6 +1581,8 @@ fn help() !void {
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
+        \\  control [--protocol v1] [--rows N --cols N] <name> [command...] Binary control lane
+        \\  control [--protocol v1] --probe          Advertise control lane support
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
@@ -1618,6 +1664,15 @@ fn help() !void {
         \\  Examples:
         \\    echo "hello" | zmx write dev /tmp/hello.txt
         \\    cat main.zig | zmx write dev src/main.zig
+        \\
+        \\Control:
+        \\  Provides an automation-oriented binary lane over stdin/stdout.
+        \\  Frames are one byte IPC tag, four little-endian length bytes,
+        \\  then payload. Use --probe to detect stable protocol support.
+        \\
+        \\  Examples:
+        \\    zmx control --probe
+        \\    zmx control --rows 40 --cols 120 dev
         \\
         \\Wait:
         \\  Used with a detached run task to track its status.  Multiple
@@ -2452,6 +2507,285 @@ const ClientResult = struct {
     session_name: ?[]const u8,
 };
 
+const control_protocol = "zmx-control/v1";
+
+const ControlArgs = struct {
+    protocol: []const u8 = control_protocol,
+    session_name: ?[]const u8 = null,
+    command_args: []const []const u8 = &.{},
+    probe: bool = false,
+    rows: ?u16 = null,
+    cols: ?u16 = null,
+};
+
+fn canonicalControlProtocol(protocol: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, protocol, "v1") or std.mem.eql(u8, protocol, control_protocol)) {
+        return control_protocol;
+    }
+    return error.UnsupportedControlProtocol;
+}
+
+fn requirePositiveControlSize(value: u16) !u16 {
+    if (value == 0) return error.ControlSizeOutOfRange;
+    return value;
+}
+
+fn parseControlArgs(args: []const []const u8) !ControlArgs {
+    var parsed = ControlArgs{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--probe")) {
+            parsed.probe = true;
+        } else if (std.mem.eql(u8, arg, "--protocol")) {
+            i += 1;
+            if (i >= args.len) return error.ControlProtocolRequired;
+            parsed.protocol = try canonicalControlProtocol(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--protocol=")) {
+            parsed.protocol = try canonicalControlProtocol(arg["--protocol=".len..]);
+        } else if (std.mem.eql(u8, arg, "--rows")) {
+            i += 1;
+            if (i >= args.len) return error.ControlRowsRequired;
+            parsed.rows = try requirePositiveControlSize(try std.fmt.parseInt(u16, args[i], 10));
+        } else if (std.mem.eql(u8, arg, "--cols")) {
+            i += 1;
+            if (i >= args.len) return error.ControlColsRequired;
+            parsed.cols = try requirePositiveControlSize(try std.fmt.parseInt(u16, args[i], 10));
+        } else if (std.mem.startsWith(u8, arg, "--rows=")) {
+            parsed.rows = try requirePositiveControlSize(try std.fmt.parseInt(u16, arg["--rows=".len..], 10));
+        } else if (std.mem.startsWith(u8, arg, "--cols=")) {
+            parsed.cols = try requirePositiveControlSize(try std.fmt.parseInt(u16, arg["--cols=".len..], 10));
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.UnknownControlOption;
+        } else if (parsed.session_name == null) {
+            parsed.session_name = arg;
+        } else {
+            parsed.command_args = args[i..];
+            break;
+        }
+    }
+    return parsed;
+}
+
+fn controlProbeText() []const u8 {
+    return "protocol=" ++ control_protocol ++ "\n" ++
+        "tier=control\n" ++
+        "features=viewport_snapshot.v1,live_output.v1,priority_input.v1,adapter_sequence.v1\n";
+}
+
+fn printControlProbe() !void {
+    var buf: [512]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.writeAll(controlProbeText());
+    try w.interface.flush();
+}
+
+fn control(daemon: *Daemon, rows: ?u16, cols: ?u16) !void {
+    const result = try daemon.ensureSession();
+    if (result.is_daemon) return;
+
+    const client_sock = try socket.sessionConnect(daemon.socket_path);
+    std.log.info("control attached session={s}", .{daemon.session_name});
+    try controlLoop(client_sock, rows, cols);
+}
+
+const control_header_len = 5;
+const max_control_frame_len = 16 * 1024 * 1024;
+
+const ControlFrame = struct {
+    tag: ipc.Tag,
+    payload: []const u8,
+};
+
+const ControlFrameBuffer = struct {
+    buf: std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    head: usize,
+
+    fn init(alloc: std.mem.Allocator) !ControlFrameBuffer {
+        return .{
+            .buf = try std.ArrayList(u8).initCapacity(alloc, 4096),
+            .alloc = alloc,
+            .head = 0,
+        };
+    }
+
+    fn deinit(self: *ControlFrameBuffer) void {
+        self.buf.deinit(self.alloc);
+    }
+
+    fn read(self: *ControlFrameBuffer, fd: i32) !usize {
+        if (self.head > 0) {
+            const remaining = self.buf.items.len - self.head;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.buf.items[0..remaining], self.buf.items[self.head..]);
+                self.buf.items.len = remaining;
+            } else {
+                self.buf.clearRetainingCapacity();
+            }
+            self.head = 0;
+        }
+
+        var tmp: [4096]u8 = undefined;
+        const n = try posix.read(fd, &tmp);
+        if (n > 0) try self.buf.appendSlice(self.alloc, tmp[0..n]);
+        return n;
+    }
+
+    fn next(self: *ControlFrameBuffer) !?ControlFrame {
+        const available = self.buf.items[self.head..];
+        if (available.len < control_header_len) return null;
+        const len = std.mem.readInt(u32, available[1..5], .little);
+        if (len > max_control_frame_len) return error.ControlFrameTooLarge;
+        const total = control_header_len + @as(usize, len);
+        if (available.len < total) return null;
+
+        const tag: ipc.Tag = @enumFromInt(available[0]);
+        const payload = available[control_header_len..total];
+        self.head += total;
+        return .{ .tag = tag, .payload = payload };
+    }
+};
+
+fn appendControlMessage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), tag: ipc.Tag, payload: []const u8) !void {
+    try out.append(alloc, @intFromEnum(tag));
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @intCast(payload.len), .little);
+    try out.appendSlice(alloc, &len_bytes);
+    if (payload.len > 0) try out.appendSlice(alloc, payload);
+}
+
+fn appendAllowedControlFrame(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: ControlFrame) !void {
+    switch (msg.tag) {
+        .Input, .Resize, .History, .Detach => try ipc.appendMessage(alloc, out, msg.tag, msg.payload),
+        else => {},
+    }
+}
+
+fn appendAllowedControlOutput(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: ipc.SocketMsg) !void {
+    switch (msg.header.tag) {
+        .Output, .History => try appendControlMessage(alloc, out, msg.header.tag, msg.payload),
+        else => {},
+    }
+}
+
+fn controlLoop(client_sock_fd: i32, requested_rows: ?u16, requested_cols: ?u16) !void {
+    const alloc = std.heap.c_allocator;
+    defer posix.close(client_sock_fd);
+
+    var sock_flags = try posix.fcntl(client_sock_fd, posix.F.GETFL, 0);
+    sock_flags |= O_NONBLOCK;
+    _ = try posix.fcntl(client_sock_fd, posix.F.SETFL, sock_flags);
+
+    const stdin_fd = posix.STDIN_FILENO;
+    const stdin_orig_flags = try posix.fcntl(stdin_fd, posix.F.GETFL, 0);
+    _ = try posix.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags | O_NONBLOCK);
+    defer _ = posix.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags) catch {};
+
+    var stdout_orig_flags: ?usize = null;
+    if (posix.fcntl(posix.STDOUT_FILENO, posix.F.GETFL, 0)) |flags| {
+        stdout_orig_flags = flags;
+        _ = posix.fcntl(posix.STDOUT_FILENO, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+    } else |_| {}
+    defer if (stdout_orig_flags) |flags| {
+        _ = posix.fcntl(posix.STDOUT_FILENO, posix.F.SETFL, flags) catch {};
+    };
+
+    var sock_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+    defer sock_write_buf.deinit(alloc);
+    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+    defer stdout_buf.deinit(alloc);
+
+    var size = ipc.getTerminalSize(posix.STDOUT_FILENO);
+    if (requested_rows) |rows| size.rows = rows;
+    if (requested_cols) |cols| size.cols = cols;
+    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+
+    var stdin_read_buf = try ControlFrameBuffer.init(alloc);
+    defer stdin_read_buf.deinit();
+    var socket_read_buf = try ipc.SocketBuffer.init(alloc);
+    defer socket_read_buf.deinit();
+    var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 3);
+    defer poll_fds.deinit(alloc);
+
+    var stdin_open = true;
+    var stdin_eof = false;
+    while (true) {
+        poll_fds.clearRetainingCapacity();
+
+        const stdin_index: ?usize = if (stdin_open) poll_fds.items.len else null;
+        if (stdin_open) {
+            try poll_fds.append(alloc, .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 });
+        }
+
+        const socket_index = poll_fds.items.len;
+        var sock_events: i16 = posix.POLL.IN;
+        if (sock_write_buf.items.len > 0) sock_events |= posix.POLL.OUT;
+        try poll_fds.append(alloc, .{ .fd = client_sock_fd, .events = sock_events, .revents = 0 });
+
+        const stdout_index: ?usize = if (stdout_buf.items.len > 0) poll_fds.items.len else null;
+        if (stdout_buf.items.len > 0) {
+            try poll_fds.append(alloc, .{ .fd = posix.STDOUT_FILENO, .events = posix.POLL.OUT, .revents = 0 });
+        }
+
+        const timeout: i32 = if (stdin_eof) 250 else -1;
+        const poll_result = posix.poll(poll_fds.items, timeout) catch |err| {
+            if (err == error.Interrupted) continue;
+            return err;
+        };
+        if (poll_result == 0 and stdin_eof and sock_write_buf.items.len == 0 and stdout_buf.items.len == 0) return;
+
+        if (stdin_index) |idx| {
+            if (poll_fds.items[idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                const n = stdin_read_buf.read(stdin_fd) catch |err| {
+                    if (err == error.WouldBlock) continue;
+                    return err;
+                };
+                if (n == 0) {
+                    stdin_open = false;
+                    stdin_eof = true;
+                }
+                while (try stdin_read_buf.next()) |msg| {
+                    try appendAllowedControlFrame(alloc, &sock_write_buf, msg);
+                }
+            }
+        }
+
+        if (poll_fds.items[socket_index].revents & posix.POLL.IN != 0) {
+            const n = socket_read_buf.read(client_sock_fd) catch |err| {
+                if (err == error.WouldBlock) continue;
+                if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) return;
+                return err;
+            };
+            if (n == 0) return;
+            while (socket_read_buf.next()) |msg| {
+                try appendAllowedControlOutput(alloc, &stdout_buf, msg);
+            }
+        }
+
+        if (poll_fds.items[socket_index].revents & posix.POLL.OUT != 0 and sock_write_buf.items.len > 0) {
+            const n = posix.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
+                if (err == error.WouldBlock) break :blk 0;
+                if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) return;
+                return err;
+            };
+            if (n > 0) try sock_write_buf.replaceRange(alloc, 0, n, &[_]u8{});
+        }
+
+        if (stdout_index) |idx| {
+            if (poll_fds.items[idx].revents & posix.POLL.OUT != 0 and stdout_buf.items.len > 0) {
+                const n = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
+                    if (err == error.WouldBlock) break :blk 0;
+                    return err;
+                };
+                if (n > 0) try stdout_buf.replaceRange(alloc, 0, n, &[_]u8{});
+            }
+        }
+
+        if (poll_fds.items[socket_index].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) return;
+    }
+}
+
 fn clientLoop(client_sock_fd: i32) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
@@ -2909,4 +3243,70 @@ fn ignoreSigpipe() void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.PIPE, &act, null);
+}
+
+test "control args default to zmx-control v1" {
+    const parsed = try parseControlArgs(&.{"dev"});
+    try std.testing.expectEqualStrings("zmx-control/v1", parsed.protocol);
+    try std.testing.expectEqualStrings("dev", parsed.session_name.?);
+    try std.testing.expect(!parsed.probe);
+}
+
+test "control args accept short and canonical protocol names" {
+    const short = try parseControlArgs(&.{ "--protocol", "v1", "dev" });
+    try std.testing.expectEqualStrings("zmx-control/v1", short.protocol);
+    try std.testing.expectEqualStrings("dev", short.session_name.?);
+
+    const canonical = try parseControlArgs(&.{ "--protocol", "zmx-control/v1", "dev" });
+    try std.testing.expectEqualStrings("zmx-control/v1", canonical.protocol);
+    try std.testing.expectEqualStrings("dev", canonical.session_name.?);
+}
+
+test "control args reject unknown protocol names" {
+    try std.testing.expectError(error.UnsupportedControlProtocol, parseControlArgs(&.{ "--protocol", "portl-v1", "dev" }));
+}
+
+test "control args accept probe without session" {
+    const parsed = try parseControlArgs(&.{"--probe"});
+    try std.testing.expectEqualStrings("zmx-control/v1", parsed.protocol);
+    try std.testing.expect(parsed.session_name == null);
+    try std.testing.expect(parsed.probe);
+}
+
+test "control args accept canonical protocol probe" {
+    const parsed = try parseControlArgs(&.{ "--protocol", "zmx-control/v1", "--probe" });
+    try std.testing.expectEqualStrings("zmx-control/v1", parsed.protocol);
+    try std.testing.expect(parsed.session_name == null);
+    try std.testing.expect(parsed.probe);
+}
+
+test "control args accept initial surface size" {
+    const parsed = try parseControlArgs(&.{ "--rows", "40", "--cols=120", "dev" });
+    try std.testing.expectEqual(@as(u16, 40), parsed.rows.?);
+    try std.testing.expectEqual(@as(u16, 120), parsed.cols.?);
+    try std.testing.expectEqualStrings("dev", parsed.session_name.?);
+}
+
+test "control args preserve command argv after session name" {
+    const parsed = try parseControlArgs(&.{ "--protocol", "v1", "dev", "nvim", "--clean" });
+    try std.testing.expectEqualStrings("dev", parsed.session_name.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.command_args.len);
+    try std.testing.expectEqualStrings("nvim", parsed.command_args[0]);
+    try std.testing.expectEqualStrings("--clean", parsed.command_args[1]);
+}
+
+test "control args reject zero surface dimensions" {
+    try std.testing.expectError(error.ControlSizeOutOfRange, parseControlArgs(&.{ "--rows", "0", "dev" }));
+    try std.testing.expectError(error.ControlSizeOutOfRange, parseControlArgs(&.{ "--cols=0", "dev" }));
+}
+
+test "control probe text advertises stable lane metadata" {
+    const text = controlProbeText();
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "protocol=zmx-control/v1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "tier=control\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "viewport_snapshot.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "live_output.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "priority_input.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "adapter_sequence.v1") != null);
 }
