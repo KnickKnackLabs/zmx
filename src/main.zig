@@ -989,13 +989,20 @@ const Daemon = struct {
     }
 
     pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
-        // Claim leadership on any genuine user input so the current client
-        // drives terminal state/resize. Non-keyboard input (mouse, focus)
-        // shouldn't steal leadership.
+        std.log.debug("buffering pty input data={x}", .{payload});
+        // Leader forwards everything (ansi escape codes + text).
+        if (self.leader_client_fd == client.socket_fd) {
+            self.queuePtyInput(payload);
+            return;
+        }
+
+        // Non-leaders are read-only until they send genuine user input.
+        // Non-keyboard traffic (mouse, focus events) does not steal
+        // leadership and does not reach the PTY.
         if (util.isUserInput(payload)) {
             try self.setLeader(client);
+            self.queuePtyInput(payload);
         }
-        self.queuePtyInput(payload);
     }
 
     pub fn handleInit(
@@ -1063,11 +1070,19 @@ const Daemon = struct {
 
     pub fn handleResize(
         self: *Daemon,
+        client: *Client,
         pty_fd: i32,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
+
+        // Resize is a leader-only operation. If there's no leader yet, the
+        // resizing client becomes leader.
+        if (self.leader_client_fd == null) {
+            try self.setLeader(client);
+        }
+        if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         var ws: cross.c.struct_winsize = .{
@@ -2181,7 +2196,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(client, msg.payload),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
-                        .Resize => try daemon.handleResize(pty_fd, &term, msg.payload),
+                        .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
                         .Detach => {
                             daemon.handleDetach(client, i);
                             break :clients_loop;
