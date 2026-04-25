@@ -670,6 +670,9 @@ const Daemon = struct {
     cfg: *Cfg,
     alloc: std.mem.Allocator,
     clients: std.ArrayList(*Client),
+    // Controls which client is the leader. The leader controls terminal
+    // state and cols/rows of the session.
+    leader_client_fd: ?i32 = null,
     session_name: []const u8,
     socket_path: []const u8,
     running: bool,
@@ -704,6 +707,15 @@ const Daemon = struct {
 
     pub fn closeClient(self: *Daemon, client: *Client, i: usize, shutdown_on_last: bool) bool {
         const fd = client.socket_fd;
+        // leader is disconnected; clear ref so another client can claim
+        // leadership on next user input (fixes neurosnap/zmx#141).
+        if (self.leader_client_fd == client.socket_fd) {
+            std.log.info(
+                "unsetting leader session={s} fd={d}",
+                .{ self.session_name, client.socket_fd },
+            );
+            self.leader_client_fd = null;
+        }
         client.deinit();
         self.alloc.destroy(client);
         _ = self.clients.orderedRemove(i);
@@ -713,6 +725,15 @@ const Daemon = struct {
             return true;
         }
         return false;
+    }
+
+    fn setLeader(self: *Daemon, client: *Client) !void {
+        std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
+        self.leader_client_fd = client.socket_fd;
+        // Ask the new leader to send back its window size so we can
+        // resize the pty and ghostty state to match.
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Resize, "");
+        client.has_pending_output = true;
     }
 
     /// Runs in the forked child. Either execs or returns an error (caller
@@ -958,7 +979,13 @@ const Daemon = struct {
         };
     }
 
-    pub fn handleInput(self: *Daemon, payload: []const u8) void {
+    pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
+        // Claim leadership on any genuine user input so the current client
+        // drives terminal state/resize. Non-keyboard input (mouse, focus)
+        // shouldn't steal leadership.
+        if (util.isUserInput(payload)) {
+            try self.setLeader(client);
+        }
         self.queuePtyInput(payload);
     }
 
@@ -2109,7 +2136,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
-                        .Input => daemon.handleInput(msg.payload),
+                        .Input => try daemon.handleInput(client, msg.payload),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Resize => try daemon.handleResize(pty_fd, &term, msg.payload),
                         .Detach => {
