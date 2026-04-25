@@ -46,6 +46,10 @@ const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 const Command = enum {
     attach,
     run,
+    send,
+    print,
+    write,
+    tail,
     detach,
     list,
     completions,
@@ -64,6 +68,14 @@ fn parseCommand(in: []const u8) error{NameNotPartOfEnum}!Command {
         .{ "a", Command.attach },
         .{ "run", Command.run },
         .{ "r", Command.run },
+        .{ "send", Command.send },
+        .{ "s", Command.send },
+        .{ "print", Command.print },
+        .{ "p", Command.print },
+        .{ "write", Command.write },
+        .{ "wr", Command.write },
+        .{ "tail", Command.tail },
+        .{ "t", Command.tail },
         .{ "detach", Command.detach },
         .{ "d", Command.detach },
         .{ "list", Command.list },
@@ -421,6 +433,75 @@ pub fn main() !void {
             };
             std.log.info("socket path={s}", .{daemon.socket_path});
             return run(&daemon, cmd_args_raw.items);
+        },
+
+        .send, .print => |which| {
+            const first_arg = args.next();
+            if (isHelpFlag(first_arg)) {
+                const label = if (which == .send) "send" else "print";
+                const desc = if (which == .send)
+                    "Send raw bytes to session PTY input (no marker, no CR appended)"
+                else
+                    "Inject text into session output stream (visible to attached clients)";
+                return subcommandUsage(label, "<name> <text...>", desc);
+            }
+            const session_name = first_arg orelse return error.SessionNameRequired;
+            if (session_name.len == 0) return error.SessionNameRequired;
+
+            var text_parts: std.ArrayList([]const u8) = .empty;
+            defer text_parts.deinit(alloc);
+            while (args.next()) |arg| {
+                try text_parts.append(alloc, arg);
+            }
+
+            const sesh = try socket.getSeshName(alloc, session_name);
+            defer alloc.free(sesh);
+            const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+                error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+                error.OutOfMemory => return err,
+            };
+            defer alloc.free(socket_path);
+
+            const tag: ipc.Tag = if (which == .send) .Input else .Output;
+            return sendRaw(&cfg, sesh, socket_path, text_parts.items, tag);
+        },
+
+        .write => {
+            const first_arg = args.next();
+            if (isHelpFlag(first_arg)) {
+                return subcommandUsage(
+                    "write",
+                    "<name> <file_path>",
+                    "Write stdin to file_path inside the session shell (works over SSH)",
+                );
+            }
+            const session_name = first_arg orelse return error.SessionNameRequired;
+            if (session_name.len == 0) return error.SessionNameRequired;
+            const file_path = args.next() orelse return error.FilePathRequired;
+
+            const sesh = try socket.getSeshName(alloc, session_name);
+            defer alloc.free(sesh);
+
+            var daemon = Daemon{
+                .running = true,
+                .cfg = &cfg,
+                .alloc = alloc,
+                .clients = try std.ArrayList(*Client).initCapacity(alloc, 0),
+                .session_name = sesh,
+                .socket_path = undefined,
+                .pid = undefined,
+                .created_at = @intCast(std.time.timestamp()),
+            };
+            daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+                error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+                error.OutOfMemory => return err,
+            };
+            defer alloc.free(daemon.socket_path);
+            return writeFile(&daemon, file_path);
+        },
+
+        .tail => {
+            return error.NotImplemented; // see follow-up: port upstream tail() loop
         },
 
         .kill => {
@@ -1207,6 +1288,70 @@ const Daemon = struct {
         }
     }
 
+    pub fn handleOutput(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
+        try vt_stream.nextSlice(payload);
+        self.has_pty_output = true;
+        for (self.clients.items) |client| {
+            try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
+            client.has_pending_output = true;
+        }
+        if (self.clients.items.len > 0) {
+            posix.kill(self.pid, posix.SIG.WINCH) catch |err| {
+                std.log.warn("failed to send SIGWINCH err={s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    pub fn handleWrite(self: *Daemon, client: *Client, payload: []const u8) !void {
+        // Wire format: [u32 path len][path bytes][file content]
+        if (payload.len < @sizeOf(u32)) return error.InvalidPayload;
+        const path_len = std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]);
+        if (payload.len < @sizeOf(u32) + path_len) return error.InvalidPayload;
+        const file_path = payload[@sizeOf(u32)..][0..path_len];
+        const file_content = payload[@sizeOf(u32) + path_len ..];
+
+        // Inject file creation through the PTY so it works over SSH.
+        // Base64-encode content and pipe through printf | base64 -d > file.
+        // Chunk large files to stay under command-line length limits.
+        // 48000 is divisible by 3 (clean base64 boundaries) and encodes
+        // to ~64KB, well under typical ARG_MAX.
+        const chunk_size = 48000;
+        var offset: usize = 0;
+        var is_first = true;
+
+        while (offset < file_content.len or is_first) {
+            const end = @min(offset + chunk_size, file_content.len);
+            const chunk = file_content[offset..end];
+
+            const encoded_len = std.base64.standard.Encoder.calcSize(chunk.len);
+            const encoded = try self.alloc.alloc(u8, encoded_len);
+            defer self.alloc.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, chunk);
+
+            self.queuePtyInput("printf '%s' '");
+            self.queuePtyInput(encoded);
+            if (is_first) {
+                self.queuePtyInput("' | base64 -d > '");
+            } else {
+                self.queuePtyInput("' | base64 -d >> '");
+            }
+            self.queuePtyInput(file_path);
+            self.queuePtyInput("'");
+            self.queuePtyInput("\r");
+
+            offset = end;
+            is_first = false;
+        }
+
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
+        client.has_pending_output = true;
+        self.has_had_client = true;
+        std.log.debug(
+            "write command len={d} file_path={s}",
+            .{ file_content.len, file_path },
+        );
+    }
+
     pub fn handleRun(self: *Daemon, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
@@ -1725,6 +1870,117 @@ fn attach(daemon: *Daemon) !void {
     try clientLoop(client_sock);
 }
 
+/// Send raw bytes to a session's PTY. Tag selects semantics:
+///   .Input  — delivered as keystrokes (send / print-as-keystrokes)
+///   .Output — injected into the session output stream (print)
+fn sendRaw(
+    cfg: *Cfg,
+    session_name: []const u8,
+    socket_path: []const u8,
+    text_parts: [][]const u8,
+    tag: ipc.Tag,
+) !void {
+    const alloc = std.heap.c_allocator;
+
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(alloc);
+
+    if (text_parts.len > 0) {
+        for (text_parts, 0..) |part, i| {
+            if (i > 0) try payload.append(alloc, ' ');
+            try payload.appendSlice(alloc, part);
+        }
+    } else {
+        // Read from stdin when no text arguments provided.
+        const stdin_fd = posix.STDIN_FILENO;
+        if (!std.posix.isatty(stdin_fd)) {
+            while (true) {
+                var tmp: [4096]u8 = undefined;
+                const n = posix.read(stdin_fd, &tmp) catch |err| {
+                    if (err == error.WouldBlock) break;
+                    return err;
+                };
+                if (n == 0) break;
+                try payload.appendSlice(alloc, tmp[0..n]);
+            }
+            // For .Input, strip a trailing newline — the caller is expected
+            // to supply \r explicitly when they want the shell to submit
+            // the line. For .Output, forward bytes exactly as-is.
+            if (tag != .Output and payload.items.len > 0 and payload.items[payload.items.len - 1] == '\n') {
+                _ = payload.pop();
+            }
+        }
+    }
+
+    if (payload.items.len == 0) return error.TextRequired;
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) {
+            socket.cleanupStaleSocket(dir, session_name);
+            output.printError("cleaned up stale session {s}", .{session_name}) catch {};
+        } else {
+            output.printError(
+                "session {s} is unresponsive ({s})\ndaemon may be busy: try again",
+                .{ session_name, @errorName(err) },
+            ) catch {};
+        }
+        return;
+    };
+    defer posix.close(probe_result.fd);
+
+    ipc.send(probe_result.fd, tag, payload.items) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return,
+        else => return err,
+    };
+}
+
+/// Write stdin contents to `file_path` inside the session's shell.
+/// Works over SSH because the daemon injects base64-chunked printf
+/// commands through the PTY (see Daemon.handleWrite).
+fn writeFile(daemon: *Daemon, file_path: []const u8) !void {
+    const alloc = daemon.alloc;
+
+    // Slurp stdin.
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(alloc);
+    const stdin_fd = posix.STDIN_FILENO;
+    if (!std.posix.isatty(stdin_fd)) {
+        while (true) {
+            var tmp: [4096]u8 = undefined;
+            const n = posix.read(stdin_fd, &tmp) catch |err| {
+                if (err == error.WouldBlock) break;
+                return err;
+            };
+            if (n == 0) break;
+            try content.appendSlice(alloc, tmp[0..n]);
+        }
+    }
+
+    // Wire format: [u32 path len][path bytes][file content]
+    var wire_buf = std.ArrayList(u8).empty;
+    defer wire_buf.deinit(alloc);
+    const path_len: u32 = @intCast(file_path.len);
+    try wire_buf.appendSlice(alloc, std.mem.asBytes(&path_len));
+    try wire_buf.appendSlice(alloc, file_path);
+    try wire_buf.appendSlice(alloc, content.items);
+
+    const probe_result = ipc.probeSession(alloc, daemon.socket_path) catch |err| {
+        std.log.err("session not ready: {s}", .{@errorName(err)});
+        return error.SessionNotReady;
+    };
+    defer posix.close(probe_result.fd);
+
+    ipc.send(probe_result.fd, .Write, wire_buf.items) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return,
+        else => return err,
+    };
+    output.printSuccess("wrote {d} bytes to {s}", .{ content.items.len, file_path }) catch {};
+}
+
 fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     const alloc = daemon.alloc;
 
@@ -2195,6 +2451,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(client, msg.payload),
+                        .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -2211,7 +2468,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, msg.payload),
-                        .Output, .Ack, .Switch, .Write, .TaskComplete => {},
+                        .Write => try daemon.handleWrite(client, msg.payload),
+                        .Ack, .Switch, .TaskComplete => {},
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
