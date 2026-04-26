@@ -75,11 +75,33 @@ pub fn build(b: *std.Build) void {
     // Test
     {
         const test_step = b.step("test", "Run unit tests");
+        const test_module = b.addModule("test", .{
+            .root_source_file = b.path("src/test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        if (b.lazyDependency("ghostty", .{
+            .target = target,
+            .optimize = optimize,
+        })) |dep| {
+            test_module.addImport(
+                "ghostty-vt",
+                dep.module("ghostty-vt"),
+            );
+        }
         const exe_unit_tests = b.addTest(.{
-            .root_module = exe_mod,
+            .root_module = test_module,
         });
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
+    }
+
+    // Integration tests (bats)
+    {
+        const integration_step = b.step("test-integration", "Run bats integration tests");
+        const bats = b.addSystemCommand(&.{ "bats", "test/session.bats" });
+        bats.step.dependOn(b.getInstallStep());
+        integration_step.dependOn(&bats.step);
     }
 
     // Check for LSP integration
@@ -167,9 +189,11 @@ pub fn build(b: *std.Build) void {
     // Upload artifacts to pgs
     {
         const upload_step = b.step("upload", "Upload docs and dist to pgs.sh:/zmx");
-        const rsync_docs = b.addSystemCommand(&.{ "rsync", "-rv", "docs/", "pgs.sh:/zmx" });
+        const gen_doc = b.addSystemCommand(&.{ "sh", "-c", "cat README.md | pdocs -tmpl index.tmpl -toc | ssh pgs.sh /zmx/index.html" });
+        const rsync_docs = b.addSystemCommand(&.{ "rsync", "-v", "./logo.png", "pgs.sh:/zmx/" });
         const rsync_dist = b.addSystemCommand(&.{ "rsync", "-rv", "zig-out/dist/", "pgs.sh:/zmx/a" });
 
+        upload_step.dependOn(&gen_doc.step);
         upload_step.dependOn(&rsync_docs.step);
         upload_step.dependOn(&rsync_dist.step);
     }
