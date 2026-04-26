@@ -97,7 +97,8 @@ load test_helper
 @test "list: no sessions returns cleanly" {
   run "$ZMX" list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no sessions found"* ]]
+  # KKL's styled output says "no sessions" via output.printInfo.
+  [[ "$output" == *"no sessions"* ]]
 }
 
 @test "list: shows session details" {
@@ -107,7 +108,9 @@ load test_helper
   run "$ZMX" list
   [ "$status" -eq 0 ]
   [[ "$output" == *"test-list"* ]]
-  [[ "$output" == *"pid="* ]]
+  # KKL's default list is a pretty table with NAME / STATUS / AGE / CMD
+  # columns — no free-form pid=N. Assert on the header instead.
+  [[ "$output" == *"STATUS"* ]]
 }
 
 @test "list --short: shows only session names" {
@@ -138,7 +141,8 @@ load test_helper
 
   run "$ZMX" kill test-kill
   [ "$status" -eq 0 ]
-  [[ "$output" == *"killed session test-kill"* ]]
+  # KKL's styled output: "✓ killed <name>" via output.printSuccess.
+  [[ "$output" == *"killed test-kill"* ]]
 
   run "$ZMX" list --short
   [[ "$output" != *"test-kill"* ]]
@@ -152,8 +156,9 @@ load test_helper
 
   run "$ZMX" kill kill-a kill-b
   [ "$status" -eq 0 ]
-  [[ "$output" == *"killed session kill-a"* ]]
-  [[ "$output" == *"killed session kill-b"* ]]
+  # KKL's styled output: "✓ killed <name>" (per-line).
+  [[ "$output" == *"killed kill-a"* ]]
+  [[ "$output" == *"killed kill-b"* ]]
 }
 
 @test "kill --force: removes socket file for dead session" {
