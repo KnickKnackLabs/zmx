@@ -2308,7 +2308,7 @@ fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
             // getting split across the marker.
             if (stdin_buf.items.len > 0 and
                 (stdin_buf.items[stdin_buf.items.len - 1] == '\n' or
-                 stdin_buf.items[stdin_buf.items.len - 1] == '\r'))
+                    stdin_buf.items[stdin_buf.items.len - 1] == '\r'))
             {
                 _ = stdin_buf.pop();
             }
