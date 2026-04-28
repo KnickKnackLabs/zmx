@@ -23,11 +23,21 @@ jobs:
 
       - name: Extract version from tag
         id: version
+        shell: bash
         run: |
           FULL="${GITHUB_REF_NAME#v}"
-          BASE=$(echo "$FULL" | sed 's/-kkl\..*//')
+          BUILD="$FULL"
+
+          # Upstream-aligned KKL stable releases keep upstream's artifact
+          # version, e.g. v0.5.0-kkl.1 builds zmx-0.5.0-*.
+          # Snapshot/prerelease tags pass the full SemVer through, e.g.
+          # v0.6.0-alpha.kkl.1 builds zmx-0.6.0-alpha.kkl.1-*.
+          if [[ "$FULL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-kkl\.[0-9]+$ ]]; then
+            BUILD="${FULL%%-kkl.*}"
+          fi
+
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
 
       - name: Delete local tag before build
         run: |
@@ -37,12 +47,12 @@ jobs:
           git tag -d "$GITHUB_REF_NAME" 2>/dev/null || true
 
       - name: Build release binaries
-        run: zig build release -Dversion=${{ steps.version.outputs.base }}
+        run: zig build release -Dversion=${{ steps.version.outputs.build }}
 
       - name: Codesign macOS binaries
         run: |
           for arch in aarch64 x86_64; do
-            tarball="zig-out/dist/zmx-${{ steps.version.outputs.base }}-macos-${arch}.tar.gz"
+            tarball="zig-out/dist/zmx-${{ steps.version.outputs.build }}-macos-${arch}.tar.gz"
             tmpdir=$(mktemp -d)
             tar xzf "$tarball" -C "$tmpdir"
             codesign -s - "$tmpdir/zmx"
@@ -56,15 +66,15 @@ jobs:
         with:
           name: zmx ${{ steps.version.outputs.full }}
           body: |
-            KnickKnackLabs fork of [zmx](https://github.com/neurosnap/zmx) v${{ steps.version.outputs.base }} with [patches](https://github.com/KnickKnackLabs/zmx#patches).
+            KnickKnackLabs fork of [zmx](https://github.com/neurosnap/zmx) ${{ steps.version.outputs.full }} with [patches](https://github.com/KnickKnackLabs/zmx#patches).
 
             ## Install
 
             ```bash
             # macOS (Apple Silicon)
-            curl -sL https://github.com/KnickKnackLabs/zmx/releases/download/${{ github.ref_name }}/zmx-${{ steps.version.outputs.base }}-macos-aarch64.tar.gz | tar xz -C ~/.local/bin/
+            curl -sL https://github.com/KnickKnackLabs/zmx/releases/download/${{ github.ref_name }}/zmx-${{ steps.version.outputs.build }}-macos-aarch64.tar.gz | tar xz -C ~/.local/bin/
 
             # Linux (x86_64)
-            curl -sL https://github.com/KnickKnackLabs/zmx/releases/download/${{ github.ref_name }}/zmx-${{ steps.version.outputs.base }}-linux-x86_64.tar.gz | tar xz -C ~/.local/bin/
+            curl -sL https://github.com/KnickKnackLabs/zmx/releases/download/${{ github.ref_name }}/zmx-${{ steps.version.outputs.build }}-linux-x86_64.tar.gz | tar xz -C ~/.local/bin/
             ```
           files: zig-out/dist/*
