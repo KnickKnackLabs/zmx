@@ -101,6 +101,13 @@ load test_helper
   [[ "$output" == *"no sessions"* ]]
 }
 
+@test "ls aliases list" {
+  run "$ZMX" ls
+  [ "$status" -eq 0 ]
+  # KKL's styled output says "no sessions" via output.printInfo.
+  [[ "$output" == *"no sessions"* ]]
+}
+
 @test "list: shows session details" {
   "$ZMX" run test-list -d echo hello
   wait_for_session test-list

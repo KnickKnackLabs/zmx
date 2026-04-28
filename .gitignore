@@ -10,7 +10,11 @@ zig_std_src/
 ghostty_src/
 prior_art/
 scratch/
+docs/plans/
 .beads/
+.agents/
+.pi/
+zig-out-*/
 
 # Nix
 result

@@ -80,15 +80,14 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        if (b.lazyDependency("ghostty", .{
+        const test_dep = b.dependency("ghostty", .{
             .target = target,
             .optimize = optimize,
-        })) |dep| {
-            test_module.addImport(
-                "ghostty-vt",
-                dep.module("ghostty-vt"),
-            );
-        }
+        });
+        test_module.addImport(
+            "ghostty-vt",
+            test_dep.module("ghostty-vt"),
+        );
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
         });
@@ -119,15 +118,13 @@ pub fn build(b: *std.Build) void {
         check.dependOn(&exe_check.step);
     }
 
-    // Release step - macOS can cross-compile to Linux,
-    // but Linux cannot cross-compile to macOS (needs SDK)
+    // Release step - cross-compile to all targets from any host
     {
         const release_step = b.step(
             "release",
-            "Build release binaries (macOS builds all, Linux builds Linux only)",
+            "Build release binaries for all platforms",
         );
-        const native_os = @import("builtin").os.tag;
-        const release_targets = if (native_os == .macos) linux_targets ++ macos_targets else linux_targets;
+        const release_targets = linux_targets ++ macos_targets;
         for (release_targets) |release_target| {
             const resolved = b.resolveTargetQuery(release_target);
             const release_mod = b.createModule(.{
