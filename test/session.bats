@@ -51,6 +51,18 @@ load test_helper
 }
 
 # ============================================================================
+# Control protocol
+# ============================================================================
+
+@test "control: command-on-create emits immediate startup output" {
+  run bash -c 'env ZMX_DIR="$1" timeout 5 "$0" control --rows 24 --cols 80 control-immediate /bin/echo bats-control-startup | od -An -tx1 | tr -d " \n"' "$ZMX" "$ZMX_DIR"
+  [ "$status" -eq 0 ]
+  # Hex for "bats-control-startup". The control stream is binary-framed,
+  # so assert on hex rather than raw shell-captured bytes.
+  [[ "$output" == *"626174732d636f6e74726f6c2d73746172747570"* ]]
+}
+
+# ============================================================================
 # Send (raw PTY input)
 # ============================================================================
 

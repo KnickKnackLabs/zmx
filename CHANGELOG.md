@@ -6,6 +6,13 @@ Use spec: https://common-changelog.org/
 
 ### Added
 
+- Added `zmx control`, an upstream-neutral automation control protocol
+  with stable `zmx-control/v1` probing, explicit binary frames, optional
+  initial rows/cols, command-on-create argv support, and attach-compatible
+  session creation semantics.
+
+### Changed
+
 - `zmx send` send raw bytes to session without ZMX completion marker or auto-newline
 - `zmx print` send raw bytes to client's stdout
 - `zmx ls` is accepted as an alias for `zmx list`

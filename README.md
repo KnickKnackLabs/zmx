@@ -77,6 +77,8 @@ zmx kill <name>...               # Kill session(s)
 zmx history <name> [--vt|--html] # Session scrollback
 zmx wait <name>...               # Wait for tasks to complete
 zmx detach                       # Detach from current session
+zmx control <name> [command...]  # Binary control lane
+zmx control --probe              # Advertise control support
 ```
 
 ## License
