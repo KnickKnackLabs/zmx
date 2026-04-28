@@ -23,9 +23,6 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Patch ghostty dependency
-        run: ./patch-ghostty-build.sh
-
       - name: Check compilation
         run: zig build check
 

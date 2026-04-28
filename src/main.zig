@@ -33,8 +33,10 @@ fn zmxLogFn(
     log_system.log(level, scope, format, args);
 }
 
-var sigwinch_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Self-pipe woken by signal handlers. std.posix.poll loops on .INTR internally
+/// (PollError has no Interrupted member), so a signal that lands during poll()
+/// never surfaces; the handler writes a byte here and poll() wakes on POLLIN.
+var sig_pipe: [2]posix.fd_t = .{ -1, -1 };
 
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
@@ -101,6 +103,8 @@ fn parseCommand(in: []const u8) error{NameNotPartOfEnum}!Command {
         .{ "d", Command.detach },
         .{ "list", Command.list },
         .{ "l", Command.list },
+        // Upstream 129875f — `ls` is a muscle-memory alias for `list`.
+        .{ "ls", Command.list },
         .{ "completions", Command.completions },
         .{ "c", Command.completions },
         .{ "kill", Command.kill },
@@ -202,6 +206,7 @@ test "parseCommand — aliases" {
     try std.testing.expectEqual(Command.run, try parseCommand("r"));
     try std.testing.expectEqual(Command.detach, try parseCommand("d"));
     try std.testing.expectEqual(Command.list, try parseCommand("l"));
+    try std.testing.expectEqual(Command.list, try parseCommand("ls"));
     try std.testing.expectEqual(Command.completions, try parseCommand("c"));
     try std.testing.expectEqual(Command.kill, try parseCommand("k"));
     try std.testing.expectEqual(Command.rm, try parseCommand("rm"));
@@ -225,6 +230,18 @@ test "isHelpFlag" {
     try std.testing.expect(!isHelpFlag("--version"));
     try std.testing.expect(!isHelpFlag("help"));
     try std.testing.expect(!isHelpFlag(""));
+}
+
+fn openSignalPipe() !void {
+    sig_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+}
+
+fn drainSignalPipe() void {
+    var b: [16]u8 = undefined;
+    while (true) {
+        const n = posix.read(sig_pipe[0], &b) catch return;
+        if (n == 0) return;
+    }
 }
 
 pub fn main() !void {
@@ -826,6 +843,7 @@ const Daemon = struct {
     cwd: []const u8 = "",
     has_pty_output: bool = false,
     has_had_client: bool = false,
+    has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
@@ -977,8 +995,8 @@ const Daemon = struct {
         var should_create = !exists;
 
         if (exists) {
-            if (ipc.probeSession(self.alloc, self.socket_path)) |result| {
-                posix.close(result.fd);
+            if (ipc.connectSession(self.socket_path)) |fd| {
+                posix.close(fd);
                 if (self.command != null) {
                     std.log.warn(
                         "session already exists, ignoring command session={s}",
@@ -991,12 +1009,12 @@ const Daemon = struct {
                     socket.cleanupStaleSocket(dir, self.session_name);
                     should_create = true;
                 },
-                // Probe didn't respond in time -- daemon may just be busy.
-                // The probe is only to decide create-vs-attach; the session
-                // exists, so proceed to attach rather than fail or orphan.
+                // Connect failed for an unusual reason. The check is only to
+                // decide create-vs-attach; the socket file exists, so proceed
+                // to attach rather than fail or orphan.
                 else => {
                     std.log.warn(
-                        "probe slow ({s}), proceeding to attach session={s}",
+                        "connect failed ({s}), proceeding to attach session={s}",
                         .{ @errorName(err), self.session_name },
                     );
                 },
@@ -1201,7 +1219,10 @@ const Daemon = struct {
         try term.resize(self.alloc, resize.cols, resize.rows);
 
         // Mark that we've had a client init, so subsequent clients get terminal state
+        // (KKL flattened the `if has_had_client` wrapper). has_terminal_client
+        // gates DA-query relay (upstream c654778).
         self.has_had_client = true;
+        self.has_terminal_client = true;
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1270,12 +1291,19 @@ const Daemon = struct {
     }
 
     pub fn handleInfo(self: *Daemon, client: *Client) !void {
-        const clients_len = self.clients.items.len - 1;
+        // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
+        // tail bytes (daemon stack contents) to clients.
+        var info = std.mem.zeroes(ipc.Info);
+        info.clients_len = self.clients.items.len - 1;
+        info.pid = self.pid;
+        info.created_at = self.created_at;
+        info.task_ended_at = self.task_ended_at orelse 0;
+        info.task_exit_code = self.task_exit_code orelse 0;
 
         // Build command string from args, re-quoting args that contain
         // shell-special characters so the displayed command is copy-pasteable.
-        var cmd_buf: [ipc.MAX_CMD_LEN]u8 = undefined;
-        var cmd_len: u16 = 0;
+        // Upstream 6eea0f6 dropped task_command from the IPC because of [][]u8
+        // marshalling pain. KKL keeps falling back to it for `run`-mode display.
         const cur_cmd = self.command orelse self.task_command;
         if (cur_cmd) |args| {
             for (args, 0..) |arg, i| {
@@ -1287,40 +1315,27 @@ const Daemon = struct {
                 const src = quoted orelse arg;
 
                 const need = src.len + @as(usize, if (i > 0) 1 else 0);
-                if (cmd_len + need > ipc.MAX_CMD_LEN) {
+                if (info.cmd_len + need > ipc.MAX_CMD_LEN) {
                     const ellipsis = "...";
-                    if (cmd_len + ellipsis.len <= ipc.MAX_CMD_LEN) {
-                        @memcpy(cmd_buf[cmd_len..][0..ellipsis.len], ellipsis);
-                        cmd_len += ellipsis.len;
+                    if (info.cmd_len + ellipsis.len <= ipc.MAX_CMD_LEN) {
+                        @memcpy(info.cmd[info.cmd_len..][0..ellipsis.len], ellipsis);
+                        info.cmd_len += ellipsis.len;
                     }
                     break;
                 }
 
                 if (i > 0) {
-                    cmd_buf[cmd_len] = ' ';
-                    cmd_len += 1;
+                    info.cmd[info.cmd_len] = ' ';
+                    info.cmd_len += 1;
                 }
-                @memcpy(cmd_buf[cmd_len..][0..src.len], src);
-                cmd_len += @intCast(src.len);
+                @memcpy(info.cmd[info.cmd_len..][0..src.len], src);
+                info.cmd_len += @intCast(src.len);
             }
         }
 
-        // Copy cwd
-        var cwd_buf: [ipc.MAX_CWD_LEN]u8 = undefined;
-        const cwd_len: u16 = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
-        @memcpy(cwd_buf[0..cwd_len], self.cwd[0..cwd_len]);
+        info.cwd_len = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
+        @memcpy(info.cwd[0..info.cwd_len], self.cwd[0..info.cwd_len]);
 
-        const info = ipc.Info{
-            .clients_len = clients_len,
-            .pid = self.pid,
-            .cmd_len = cmd_len,
-            .cwd_len = cwd_len,
-            .cmd = cmd_buf,
-            .cwd = cwd_buf,
-            .created_at = self.created_at,
-            .task_ended_at = self.task_ended_at orelse 0,
-            .task_exit_code = self.task_exit_code orelse 0,
-        };
         try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info));
         client.has_pending_output = true;
     }
@@ -1370,7 +1385,7 @@ const Daemon = struct {
     }
 
     pub fn handleOutput(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
-        try vt_stream.nextSlice(payload);
+        vt_stream.nextSlice(payload);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
             try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
@@ -1517,17 +1532,101 @@ fn help() !void {
         \\Usage: zmx <command> [args]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
-        \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
-        \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
-        \\  [l]ist [--short]               List active sessions
-        \\  [k]ill <name>... [--force]     Kill a session and all attached clients
-        \\  rm <name>...                   Remove a session (kill if running, delete socket)
-        \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
-        \\  [w]ait <name>...               Wait for session tasks to complete
-        \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
-        \\  [v]ersion                      Show version information
-        \\  [h]elp                         Show this help message
+        \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  [r]un <name> [-d] [command...]           Send command without attaching
+        \\  [s]end <name> <text...>                  Send raw input to session PTY
+        \\  [p]rint <name> <text...>                 Inject text into session display
+        \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
+        \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
+        \\  [l]ist|ls [--short]                      List active sessions
+        \\  [k]ill <name>... [--force]               Kill session and all attached clients
+        \\  [hi]story <name> [--vt|--html]           Output session scrollback
+        \\  [w]ait <name>...                         Wait for session tasks to complete
+        \\  [t]ail <name>...                         Follow session output
+        \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish)
+        \\  [v]ersion                                Show version
+        \\  [h]elp                                   Show this help
+        \\
+        \\Attach:
+        \\  This will spawn a login $SHELL with a PTY.  You can provide a
+        \\  command instead of creating a shell.
+        \\
+        \\  Examples:
+        \\    zmx attach dev
+        \\    zmx attach dev vim
+        \\
+        \\History:
+        \\  This should generally be used with `tail` to print the last lines
+        \\  of the session's scrollback history.
+        \\
+        \\  Examples:
+        \\    zmx history <session> | tail -100
+        \\
+        \\Run:
+        \\  Commands are passed as-is: do not wrap in quotes.
+        \\  Commands run sequentially: do not send multiple in parallel.
+        \\  Avoid interactive programs (pagers, editors, prompts): they hang.
+        \\
+        \\  If the command hangs, send Ctrl+C to recover:
+        \\    zmx run <session> $(printf '\x03')
+        \\
+        \\  If the command hangs, print the history to see the error:
+        \\    zmx history <session> | tail -100
+        \\
+        \\  `-d` will detach from the calling terminal. Use `wait` to track
+        \\  its status.
+        \\
+        \\  Examples:
+        \\    zmx run dev ls
+        \\    zmx run dev zig build
+        \\    zmx run dev grep -r TODO src
+        \\    zmx run dev git -c core.pager=cat diff
+        \\
+        \\Send:
+        \\  Sends raw text to the session's PTY input (fire-and-forget).
+        \\  Unlike `run`, no completion marker is appended and no exit code
+        \\  is tracked.  Useful for TUI applications, interactive prompts,
+        \\  or any program that reads stdin directly.
+        \\
+        \\  Text is sent byte-for-byte with no automatic carriage return.
+        \\  Append \r yourself when you want the shell to execute a command.
+        \\
+        \\  Text can also be piped via stdin:
+        \\    printf 'ls -la\r' | zmx send dev
+        \\
+        \\  Examples:
+        \\    printf 'echo hello\r' | zmx send dev
+        \\    zmx send dev $(printf '\x03')
+        \\    zmx send dev /compact
+        \\
+        \\Print:
+        \\  Injects text directly into the session display and scrollback.
+        \\  Never touches the PTY input -- the shell sees nothing.
+        \\  Caller is responsible for newlines (\\r\\n).
+        \\
+        \\  Examples:
+        \\    printf '\\r\\nhello\\r\\n' | zmx print dev
+        \\    zmx print dev "$(printf '\\r\\nalert\\r\\n')"
+        \\
+        \\Write:
+        \\  Writes stdin to file_path inside the session. Works over SSH.
+        \\  file_path can be absolute or relative to the session shell's cwd.
+        \\  Requires base64 and printf in the remote environment.
+        \\  Large files are chunked automatically (~48KB per chunk).
+        \\  File path must not contain single quotes.
+        \\
+        \\  Examples:
+        \\    echo "hello" | zmx write dev /tmp/hello.txt
+        \\    cat main.zig | zmx write dev src/main.zig
+        \\
+        \\Wait:
+        \\  Used with a detached run task to track its status.  Multiple
+        \\  sessions can be provided.
+        \\
+        \\  Examples:
+        \\    zmx run -d dev sleep 10
+        \\    zmx wait dev
+        \\    zmx wait dev other
         \\
         \\Environment variables:
         \\  - SHELL                Determines which shell is used when creating a session
@@ -1720,13 +1819,13 @@ fn detachAll(cfg: *Cfg) !void {
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
-    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
         return;
     };
-    defer posix.close(result.fd);
-    ipc.send(result.fd, .DetachAll, "") catch |err| switch (err) {
+    defer posix.close(fd);
+    ipc.send(fd, .DetachAll, "") catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -1751,7 +1850,7 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
         output.printError("session \"{s}\" does not exist", .{session_name}) catch {};
         return error.SessionNotFound;
     }
-    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (force or err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(dir, session_name);
@@ -1762,8 +1861,8 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
         return;
     };
 
-    defer posix.close(result.fd);
-    ipc.send(result.fd, .Kill, "") catch |err| switch (err) {
+    defer posix.close(fd);
+    ipc.send(fd, .Kill, "") catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -1845,15 +1944,15 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
         output.printError("session \"{s}\" does not exist", .{session_name}) catch {};
         return error.SessionNotFound;
     }
-    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
         return;
     };
-    defer posix.close(result.fd);
+    defer posix.close(fd);
 
     const format_byte = [_]u8{@intFromEnum(format)};
-    ipc.send(result.fd, .History, &format_byte) catch |err| switch (err) {
+    ipc.send(fd, .History, &format_byte) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -1862,14 +1961,14 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     defer sb.deinit();
 
     while (true) {
-        var poll_fds = [_]posix.pollfd{.{ .fd = result.fd, .events = posix.POLL.IN, .revents = 0 }};
+        var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
         const poll_result = posix.poll(&poll_fds, 5000) catch return;
         if (poll_result == 0) {
             std.log.err("timeout waiting for history response", .{});
             return;
         }
 
-        const n = sb.read(result.fd) catch return;
+        const n = sb.read(fd) catch return;
         if (n == 0) return;
 
         while (sb.next()) |msg| {
@@ -1905,14 +2004,14 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
         output.printError("session \"{s}\" does not exist", .{current_sesh}) catch {};
         return error.SessionNotFound;
     }
-    const result = ipc.probeSession(daemon.alloc, socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, current_sesh);
         return;
     };
-    defer posix.close(result.fd);
+    defer posix.close(fd);
 
-    ipc.send(result.fd, .Switch, next_session) catch |err| switch (err) {
+    ipc.send(fd, .Switch, next_session) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -2324,7 +2423,10 @@ fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
         return error.CommandRequired;
     }
 
-    const client_sock = try socket.sessionConnect(daemon.socket_path);
+    const client_sock = ipc.connectSession(daemon.socket_path) catch |err| {
+        std.log.err("session not ready: {s}", .{@errorName(err)});
+        return error.SessionNotReady;
+    };
     defer posix.close(client_sock);
 
     var fds = try std.ArrayList(i32).initCapacity(alloc, 1);
@@ -2355,7 +2457,8 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
 
-    setupSigwinchHandler();
+    try openSignalPipe();
+    installWakeHandler(posix.SIG.WINCH);
 
     // Make socket non-blocking to avoid blocking on writes
     var sock_flags = try posix.fcntl(client_sock_fd, posix.F.GETFL, 0);
@@ -2389,12 +2492,6 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     defer _ = posix.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags) catch {};
 
     while (true) {
-        // Check for pending SIGWINCH
-        if (sigwinch_received.swap(false, .acq_rel)) {
-            const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-            try ipc.appendMessage(alloc, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
-        }
-
         poll_fds.clearRetainingCapacity();
 
         try poll_fds.append(alloc, .{
@@ -2414,6 +2511,8 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             .revents = 0,
         });
 
+        try poll_fds.append(alloc, .{ .fd = sig_pipe[0], .events = posix.POLL.IN, .revents = 0 });
+
         if (stdout_buf.items.len > 0) {
             try poll_fds.append(alloc, .{
                 .fd = posix.STDOUT_FILENO,
@@ -2422,10 +2521,13 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             });
         }
 
-        _ = posix.poll(poll_fds.items, -1) catch |err| {
-            if (err == error.Interrupted) continue; // EINTR from signal, loop again
-            return err;
-        };
+        _ = try posix.poll(poll_fds.items, -1);
+
+        if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
+            drainSignalPipe();
+            const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
+            try ipc.appendMessage(alloc, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
+        }
 
         // Handle stdin -> socket (Input)
         const inp_flags = (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL);
@@ -2522,7 +2624,8 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
     daemon.pty_fd = pty_fd;
-    setupSigtermHandler();
+    try openSignalPipe();
+    installWakeHandler(posix.SIG.TERM);
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(daemon.alloc, 8);
     defer poll_fds.deinit(daemon.alloc);
 
@@ -2537,14 +2640,6 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     defer vt_stream.deinit();
 
     daemon_loop: while (daemon.running) {
-        if (sigterm_received.swap(false, .acq_rel)) {
-            std.log.info(
-                "SIGTERM received, shutting down gracefully session={s}",
-                .{daemon.session_name},
-            );
-            break :daemon_loop;
-        }
-
         poll_fds.clearRetainingCapacity();
 
         try poll_fds.append(daemon.alloc, .{
@@ -2563,6 +2658,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             .revents = 0,
         });
 
+        try poll_fds.append(daemon.alloc, .{ .fd = sig_pipe[0], .events = posix.POLL.IN, .revents = 0 });
+
         for (daemon.clients.items) |client| {
             var events: i16 = posix.POLL.IN;
             if (client.has_pending_output) {
@@ -2575,10 +2672,16 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             });
         }
 
-        _ = posix.poll(poll_fds.items, -1) catch |err| {
-            if (err == error.Interrupted) continue;
-            return err;
-        };
+        _ = try posix.poll(poll_fds.items, -1);
+
+        if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
+            drainSignalPipe();
+            std.log.info(
+                "SIGTERM received, shutting down gracefully session={s}",
+                .{daemon.session_name},
+            );
+            break :daemon_loop;
+        }
 
         if (poll_fds.items[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
             std.log.err("server socket error revents={d}", .{poll_fds.items[0].revents});
@@ -2621,15 +2724,16 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
-                    try vt_stream.nextSlice(buf[0..n]);
+                    vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
 
-                    // When no clients are attached, respond to terminal
-                    // queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents shells like from fish from waiting 2s
-                    // and then sending a no DA query response warning because
-                    // there's no client terminal to respond to the query.
-                    if (daemon.clients.items.len == 0 and
+                    // When no real terminal client has attached yet, respond to
+                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
+                    // This prevents fish from waiting 10s for unanswered queries.
+                    // `has_terminal_client` is only set when a client sends .Init
+                    // (a real zmx attach), not when a `zmx run` tail-only client
+                    // connects.
+                    if (!daemon.has_terminal_client and
                         daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
                     {
                         util.respondToDeviceAttributes(daemon.alloc, &daemon.pty_write_buf, buf[0..n]);
@@ -2689,9 +2793,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
         var i: usize = daemon.clients.items.len;
         // Only iterate over clients that were present when poll_fds was constructed
-        // poll_fds contains [server, pty, client0, client1, ...]
-        // So number of clients in poll_fds is poll_fds.items.len - 2
-        const num_polled_clients = poll_fds.items.len - 2;
+        // poll_fds contains [server, pty, sig_pipe, client0, client1, ...]
+        // So number of clients in poll_fds is poll_fds.items.len - 3
+        const num_polled_clients = poll_fds.items.len - 3;
         if (i > num_polled_clients) {
             // If we have more clients than polled (i.e. we just accepted one), start from the
             // polled ones
@@ -2701,7 +2805,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         clients_loop: while (i > 0) {
             i -= 1;
             const client = daemon.clients.items[i];
-            const revents = poll_fds.items[i + 2].revents;
+            const revents = poll_fds.items[i + 3].revents;
 
             if (revents & posix.POLL.IN != 0) {
                 const n = client.read_buf.read(client.socket_fd) catch |err| {
@@ -2780,33 +2884,22 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     }
 }
 
-fn handleSigwinch(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    sigwinch_received.store(true, .release);
+fn wakeSignalPipe(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    const saved = std.c._errno().*;
+    _ = std.c.write(sig_pipe[1], "x", 1);
+    std.c._errno().* = saved;
 }
 
-fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    sigterm_received.store(true, .release);
-}
-
-// No SA_RESTART: we want the signal to interrupt poll() so the
-// loop can check the flag. On BSD/macOS, SA_RESTART makes poll restartable,
-// which would leave an idle daemon deaf to SIGTERM until other I/O wakes it.
-fn setupSigwinchHandler() void {
+// std.posix.poll retries EINTR internally, so SA_RESTART is moot -- neither
+// setting wakes the loop. The handler writes to sig_pipe instead; poll()
+// wakes on its read end.
+fn installWakeHandler(sig: u6) void {
     const act: posix.Sigaction = .{
-        .handler = .{ .sigaction = handleSigwinch },
+        .handler = .{ .sigaction = wakeSignalPipe },
         .mask = posix.sigemptyset(),
         .flags = posix.SA.SIGINFO,
     };
-    posix.sigaction(posix.SIG.WINCH, &act, null);
-}
-
-fn setupSigtermHandler() void {
-    const act: posix.Sigaction = .{
-        .handler = .{ .sigaction = handleSigterm },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.SIGINFO,
-    };
-    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(sig, &act, null);
 }
 
 fn ignoreSigpipe() void {
