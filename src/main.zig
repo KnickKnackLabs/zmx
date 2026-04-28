@@ -416,6 +416,7 @@ pub fn main() !void {
                 .command = control_command,
                 .cwd = cwd,
                 .created_at = @intCast(std.time.timestamp()),
+                .start_child_on_init = control_command != null,
             };
             daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
                 error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
@@ -896,11 +897,47 @@ const Daemon = struct {
     is_fish: bool = false, // true if the session's foreground shell is fish
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    start_child_on_init: bool = false,
+    child_start_fd: posix.fd_t = -1,
 
     pub fn deinit(self: *Daemon) void {
+        self.closeChildStartFd();
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
         self.alloc.free(self.socket_path);
+    }
+
+    fn closeChildStartFd(self: *Daemon) void {
+        if (self.child_start_fd >= 0) {
+            posix.close(self.child_start_fd);
+            self.child_start_fd = -1;
+        }
+    }
+
+    fn releaseChildStart(self: *Daemon) void {
+        if (self.child_start_fd >= 0) {
+            _ = posix.write(self.child_start_fd, "x") catch {};
+            self.closeChildStartFd();
+        }
+    }
+
+    fn flushPendingClientOutput(self: *Daemon) void {
+        for (self.clients.items) |client| {
+            while (client.write_buf.items.len > 0) {
+                const n = posix.write(client.socket_fd, client.write_buf.items) catch |err| {
+                    if (err != error.WouldBlock) {
+                        std.log.debug(
+                            "client final flush failed fd={d} err={s}",
+                            .{ client.socket_fd, @errorName(err) },
+                        );
+                    }
+                    break;
+                };
+                if (n == 0) break;
+                client.write_buf.replaceRange(self.alloc, 0, n, &[_]u8{}) catch break;
+            }
+            client.has_pending_output = client.write_buf.items.len > 0;
+        }
     }
 
     pub fn shutdown(self: *Daemon) void {
@@ -1002,13 +1039,38 @@ const Daemon = struct {
             .ws_ypixel = 0,
         };
 
+        var start_pipe: [2]posix.fd_t = .{ -1, -1 };
+        if (self.start_child_on_init) {
+            start_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+        }
+
         var master_fd: c_int = undefined;
         const pid = cross.forkpty(&master_fd, null, null, &ws);
         if (pid < 0) {
+            if (start_pipe[0] >= 0) posix.close(start_pipe[0]);
+            if (start_pipe[1] >= 0) posix.close(start_pipe[1]);
             return error.ForkPtyFailed;
         }
 
         if (pid == 0) { // child pid code path
+            if (self.start_child_on_init) {
+                posix.close(start_pipe[1]);
+                var start_byte: [1]u8 = undefined;
+                while (true) {
+                    const n = posix.read(start_pipe[0], &start_byte) catch |err| {
+                        if (err == error.Interrupted) continue;
+                        std.log.err("child start wait failed: {s}", .{@errorName(err)});
+                        std.posix.exit(1);
+                    };
+                    if (n == 0) {
+                        std.log.err("child start wait closed before release", .{});
+                        std.posix.exit(1);
+                    }
+                    break;
+                }
+                posix.close(start_pipe[0]);
+            }
+
             // In the forked child, ANY error must exit rather than propagate:
             // a returned error falls through to the parent code path below,
             // running a second daemon on the same socket (or worse, hitting
@@ -1020,6 +1082,10 @@ const Daemon = struct {
             unreachable; // execChild either execs or exits, never returns ok
         }
         // master pid code path
+        if (self.start_child_on_init) {
+            posix.close(start_pipe[0]);
+            self.child_start_fd = start_pipe[1];
+        }
         self.pid = pid;
         std.log.info("pty spawned session={s} pid={d}", .{ self.session_name, pid });
 
@@ -1267,6 +1333,7 @@ const Daemon = struct {
         // gates DA-query relay (upstream c654778).
         self.has_had_client = true;
         self.has_terminal_client = true;
+        self.releaseChildStart();
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -2584,9 +2651,13 @@ fn control(daemon: *Daemon, rows: ?u16, cols: ?u16) !void {
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
 
+    const command_on_create = result.created and daemon.command != null;
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("control attached session={s}", .{daemon.session_name});
-    try controlLoop(client_sock, rows, cols);
+    try controlLoop(client_sock, rows, cols, .{
+        .replay_initial_history = command_on_create,
+        .drain_after_stdin_eof = command_on_create,
+    });
 }
 
 const control_header_len = 5;
@@ -2669,7 +2740,17 @@ fn appendAllowedControlOutput(alloc: std.mem.Allocator, out: *std.ArrayList(u8),
     }
 }
 
-fn controlLoop(client_sock_fd: i32, requested_rows: ?u16, requested_cols: ?u16) !void {
+const ControlLoopOptions = struct {
+    replay_initial_history: bool = false,
+    drain_after_stdin_eof: bool = false,
+};
+
+fn controlLoop(
+    client_sock_fd: i32,
+    requested_rows: ?u16,
+    requested_cols: ?u16,
+    options: ControlLoopOptions,
+) !void {
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
 
@@ -2700,6 +2781,10 @@ fn controlLoop(client_sock_fd: i32, requested_rows: ?u16, requested_cols: ?u16) 
     if (requested_rows) |rows| size.rows = rows;
     if (requested_cols) |cols| size.cols = cols;
     try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    if (options.replay_initial_history) {
+        const format_byte = [_]u8{@intFromEnum(util.HistoryFormat.plain)};
+        try ipc.appendMessage(alloc, &sock_write_buf, .History, &format_byte);
+    }
 
     var stdin_read_buf = try ControlFrameBuffer.init(alloc);
     defer stdin_read_buf.deinit();
@@ -2728,7 +2813,7 @@ fn controlLoop(client_sock_fd: i32, requested_rows: ?u16, requested_cols: ?u16) 
             try poll_fds.append(alloc, .{ .fd = posix.STDOUT_FILENO, .events = posix.POLL.OUT, .revents = 0 });
         }
 
-        const timeout: i32 = if (stdin_eof) 250 else -1;
+        const timeout: i32 = if (stdin_eof and !options.drain_after_stdin_eof) 250 else -1;
         const poll_result = posix.poll(poll_fds.items, timeout) catch |err| {
             if (err == error.Interrupted) continue;
             return err;
@@ -3053,8 +3138,12 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
             if (n_opt) |n| {
                 if (n == 0) {
-                    // EOF: Shell exited
+                    // EOF: Shell exited. Flush any data queued by the previous
+                    // PTY read before closing the client sockets; fast commands
+                    // can output and exit before the next poll marks clients
+                    // writable.
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
+                    daemon.flushPendingClientOutput();
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
