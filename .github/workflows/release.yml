@@ -29,9 +29,6 @@ jobs:
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
-      - name: Patch ghostty dependency
-        run: ./patch-ghostty-build.sh
-
       - name: Delete local tag before build
         run: |
           # Ghostty's build system runs git tag detection and panics if

@@ -46,16 +46,11 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("zigcli", zigcli_dep.module("zigcli"));
     }
 
-    if (b.lazyDependency("ghostty", .{
+    const dep = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
-        .@"emit-xcframework" = false,
-    })) |dep| {
-        exe_mod.addImport(
-            "ghostty-vt",
-            dep.module("ghostty-vt"),
-        );
-    }
+    });
+    exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
 
     // Run
     {
@@ -84,10 +79,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        test_module.addImport(
-            "ghostty-vt",
-            test_dep.module("ghostty-vt"),
-        );
+        test_module.addImport("ghostty-vt", test_dep.module("ghostty-vt"));
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
         });
@@ -111,10 +103,6 @@ pub fn build(b: *std.Build) void {
             .root_module = exe_mod,
         });
         exe_check.linkLibC();
-
-        // Finally we add the "check" step which will be detected
-        // by ZLS and automatically enable Build-On-Save.
-        // If you copy this into your `build.zig`, make sure to rename 'foo'
         check.dependOn(&exe_check.step);
     }
 
@@ -144,13 +132,11 @@ pub fn build(b: *std.Build) void {
                 release_mod.addImport("zigcli", zigcli_dep.module("zigcli"));
             }
 
-            if (b.lazyDependency("ghostty", .{
+            const release_dep = b.dependency("ghostty", .{
                 .target = resolved,
                 .optimize = .ReleaseSafe,
-                .@"emit-xcframework" = false,
-            })) |dep| {
-                release_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-            }
+            });
+            release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
 
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
