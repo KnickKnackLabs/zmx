@@ -773,12 +773,18 @@ pub fn main() !void {
     }
 }
 
-/// Client represents each terminal that has connected to a session.
+const ClientKind = enum {
+    terminal,
+    control,
+};
+
+/// Client represents each terminal or control adapter that has connected to a session.
 ///
 /// Multiple Clients can connect to a single session.
 const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
+    kind: ClientKind = .terminal,
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -1271,6 +1277,30 @@ const Daemon = struct {
         }
     }
 
+    fn applyClientResize(
+        self: *Daemon,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        resize: ipc.Resize,
+    ) !void {
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = resize.rows,
+            .ws_col = resize.cols,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        };
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        // Disable prompt_redraw before resize. The daemon's internal
+        // terminal would otherwise clear prompt lines expecting the
+        // shell to redraw them, but the shell's redraw goes to the PTY
+        // (forwarded to clients), not to this daemon terminal. The
+        // clearing corrupts the daemon's snapshot state.
+        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
+        term.flags.shell_redraws_prompt = .false;
+        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        try term.resize(self.alloc, resize.cols, resize.rows);
+    }
+
     pub fn handleInit(
         self: *Daemon,
         client: *Client,
@@ -1311,22 +1341,7 @@ const Daemon = struct {
             }
         }
 
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        // Disable prompt_redraw before resize. The daemon's internal
-        // terminal would otherwise clear prompt lines expecting the
-        // shell to redraw them, but the shell's redraw goes to the PTY
-        // (forwarded to clients), not to this daemon terminal. The
-        // clearing corrupts the daemon's snapshot state.
-        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-        term.flags.shell_redraws_prompt = .false;
-        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        try term.resize(self.alloc, resize.cols, resize.rows);
+        try self.applyClientResize(pty_fd, term, resize);
 
         // Mark that we've had a client init, so subsequent clients get terminal state
         // (KKL flattened the `if has_had_client` wrapper). has_terminal_client
@@ -1336,6 +1351,71 @@ const Daemon = struct {
         self.releaseChildStart();
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    fn queueViewportSnapshot(
+        self: *Daemon,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+    ) void {
+        if (util.serializeViewportSnapshot(self.alloc, term)) |snapshot| {
+            defer self.alloc.free(snapshot);
+            const restore_data = util.rewritePromptRedraw(self.alloc, snapshot) orelse snapshot;
+            defer if (restore_data.ptr != snapshot.ptr) self.alloc.free(restore_data);
+            ipc.appendMessage(self.alloc, &client.write_buf, .ViewportSnapshot, restore_data) catch |err| {
+                std.log.warn(
+                    "failed to buffer viewport snapshot for control client err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            client.has_pending_output = true;
+        }
+    }
+
+    fn queuePtyOutput(
+        self: *Daemon,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) void {
+        if (client.kind == .control and shouldCoalesceControlRender(client.kind, client.write_buf.items.len, payload.len)) {
+            client.write_buf.clearRetainingCapacity();
+            self.queueViewportSnapshot(client, term);
+            return;
+        }
+
+        const tag: ipc.Tag = if (client.kind == .control) .LiveOutput else .Output;
+        ipc.appendMessage(self.alloc, &client.write_buf, tag, payload) catch |err| {
+            std.log.warn(
+                "failed to buffer output for client err={s}",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        client.has_pending_output = true;
+    }
+
+    pub fn handleControlInit(
+        self: *Daemon,
+        client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != @sizeOf(ipc.Resize)) return;
+
+        client.kind = .control;
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+
+        if (self.has_pty_output) self.queueViewportSnapshot(client, term);
+
+        try self.applyClientResize(pty_fd, term, resize);
+        self.has_had_client = true;
+        self.has_terminal_client = true;
+        self.releaseChildStart();
+
+        std.log.debug("control init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
     pub fn handleResize(
@@ -1355,18 +1435,7 @@ const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        // Disable prompt_redraw before resize (same rationale as handleInit).
-        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-        term.flags.shell_redraws_prompt = .false;
-        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        try term.resize(self.alloc, resize.cols, resize.rows);
+        try self.applyClientResize(pty_fd, term, resize);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1461,12 +1530,18 @@ const Daemon = struct {
             std.meta.intToEnum(util.HistoryFormat, payload[0]) catch .plain
         else
             .plain;
-        if (util.serializeTerminal(self.alloc, term, format)) |serialized| {
+        if (util.serializeTerminalHistory(self.alloc, term, format)) |serialized| {
             defer self.alloc.free(serialized);
-            try ipc.appendMessage(self.alloc, &client.write_buf, .History, serialized);
+            if (client.kind == .control) {
+                try ipc.appendMessage(self.alloc, &client.write_buf, .HistoryChunk, serialized);
+                try ipc.appendMessage(self.alloc, &client.write_buf, .HistoryEnd, "");
+            } else {
+                try ipc.appendMessage(self.alloc, &client.write_buf, .History, serialized);
+            }
             client.has_pending_output = true;
         } else {
-            try ipc.appendMessage(self.alloc, &client.write_buf, .History, "");
+            const tag: ipc.Tag = if (client.kind == .control) .HistoryEnd else .History;
+            try ipc.appendMessage(self.alloc, &client.write_buf, tag, "");
             client.has_pending_output = true;
         }
     }
@@ -2637,7 +2712,7 @@ fn parseControlArgs(args: []const []const u8) !ControlArgs {
 fn controlProbeText() []const u8 {
     return "protocol=" ++ control_protocol ++ "\n" ++
         "tier=control\n" ++
-        "features=viewport_snapshot.v1,live_output.v1,priority_input.v1,adapter_sequence.v1\n";
+        "features=viewport_snapshot.v1,live_output.v1,priority_input.v1,adapter_sequence.v1,history_chunks.v1,latest_viewport_coalesce.v1\n";
 }
 
 fn printControlProbe() !void {
@@ -2655,13 +2730,18 @@ fn control(daemon: *Daemon, rows: ?u16, cols: ?u16) !void {
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("control attached session={s}", .{daemon.session_name});
     try controlLoop(client_sock, rows, cols, .{
-        .replay_initial_history = command_on_create,
+        .replay_initial_history = false,
         .drain_after_stdin_eof = command_on_create,
     });
 }
 
 const control_header_len = 5;
 const max_control_frame_len = 16 * 1024 * 1024;
+const CONTROL_RENDER_BACKLOG_LIMIT = 1 * 1024 * 1024;
+
+fn shouldCoalesceControlRender(kind: ClientKind, pending_bytes: usize, incoming_bytes: usize) bool {
+    return kind == .control and pending_bytes + incoming_bytes > CONTROL_RENDER_BACKLOG_LIMIT;
+}
 
 const ControlFrame = struct {
     tag: ipc.Tag,
@@ -2728,14 +2808,14 @@ fn appendControlMessage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), tag: 
 
 fn appendAllowedControlFrame(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: ControlFrame) !void {
     switch (msg.tag) {
-        .Input, .Resize, .History, .Detach => try ipc.appendMessage(alloc, out, msg.tag, msg.payload),
+        .Input, .Resize, .History, .Detach, .ControlInit => try ipc.appendMessage(alloc, out, msg.tag, msg.payload),
         else => {},
     }
 }
 
 fn appendAllowedControlOutput(alloc: std.mem.Allocator, out: *std.ArrayList(u8), msg: ipc.SocketMsg) !void {
     switch (msg.header.tag) {
-        .Output, .History => try appendControlMessage(alloc, out, msg.header.tag, msg.payload),
+        .Output, .History, .ViewportSnapshot, .LiveOutput, .HistoryChunk, .HistoryEnd => try appendControlMessage(alloc, out, msg.header.tag, msg.payload),
         else => {},
     }
 }
@@ -2780,7 +2860,7 @@ fn controlLoop(
     var size = ipc.getTerminalSize(posix.STDOUT_FILENO);
     if (requested_rows) |rows| size.rows = rows;
     if (requested_cols) |cols| size.cols = cols;
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    try ipc.appendMessage(alloc, &sock_write_buf, .ControlInit, std.mem.asBytes(&size));
     if (options.replay_initial_history) {
         const format_byte = [_]u8{@intFromEnum(util.HistoryFormat.plain)};
         try ipc.appendMessage(alloc, &sock_write_buf, .History, &format_byte);
@@ -3187,14 +3267,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     const broadcast_data = util.rewritePromptRedraw(daemon.alloc, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) daemon.alloc.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, broadcast_data) catch |err| {
-                            std.log.warn(
-                                "failed to buffer output for client err={s}",
-                                .{@errorName(err)},
-                            );
-                            continue;
-                        };
-                        client.has_pending_output = true;
+                        daemon.queuePtyOutput(client, &term, broadcast_data);
                     }
                 }
             }
@@ -3254,6 +3327,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Input => try daemon.handleInput(client, msg.payload),
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
+                        .ControlInit => try daemon.handleControlInit(client, pty_fd, &term, msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
                         .Detach => {
                             daemon.handleDetach(client, i);
@@ -3272,8 +3346,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Write => try daemon.handleWrite(client, msg.payload),
                         .Switch => try daemon.handleSwitch(msg.payload),
                         .Ack, .TaskComplete => {},
-                        _ => std.log.warn(
-                            "ignoring unknown IPC tag={d}",
+                        else => std.log.warn(
+                            "ignoring unsupported IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
                         ),
                     }
@@ -3389,6 +3463,12 @@ test "control args reject zero surface dimensions" {
     try std.testing.expectError(error.ControlSizeOutOfRange, parseControlArgs(&.{ "--cols=0", "dev" }));
 }
 
+test "control render coalescing applies only beyond control backlog cap" {
+    try std.testing.expect(!shouldCoalesceControlRender(.terminal, CONTROL_RENDER_BACKLOG_LIMIT + 1, 1));
+    try std.testing.expect(!shouldCoalesceControlRender(.control, CONTROL_RENDER_BACKLOG_LIMIT - 10, 9));
+    try std.testing.expect(shouldCoalesceControlRender(.control, CONTROL_RENDER_BACKLOG_LIMIT - 10, 11));
+}
+
 test "control probe text advertises stable lane metadata" {
     const text = controlProbeText();
     try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
@@ -3398,4 +3478,6 @@ test "control probe text advertises stable lane metadata" {
     try std.testing.expect(std.mem.indexOf(u8, text, "live_output.v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "priority_input.v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "adapter_sequence.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "history_chunks.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "latest_viewport_coalesce.v1") != null);
 }

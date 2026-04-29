@@ -476,6 +476,68 @@ pub fn isUserInput(payload: []const u8) bool {
     return false;
 }
 
+pub fn serializeViewportSnapshot(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // Synchronized output (DECSET 2026) is a transient rendering handshake
+    // between a program and its current terminal client. Replaying it to a
+    // newly attached client can leave that client deferring renders until its
+    // local timeout fires, so temporarily exclude it from restored state and
+    // restore the original mode before returning.
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, false);
+    }
+    defer if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, true);
+    };
+
+    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+
+    const pages = &term.screens.active.pages;
+    const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
+    const active_br = pages.pin(.{
+        .active = .{
+            .x = @intCast(pages.cols - 1),
+            .y = @intCast(pages.rows - 1),
+        },
+    });
+
+    if (active_tl != null and active_br != null) {
+        vis_fmt.content = .{
+            .selection = ghostty_vt.Selection.init(
+                active_tl.?,
+                active_br.?,
+                false,
+            ),
+        };
+    }
+
+    vis_fmt.extra = .{
+        .palette = false,
+        .modes = true,
+        .scrolling_region = true,
+        .tabstops = false,
+        .pwd = true,
+        .keyboard = true,
+        .screen = .all,
+    };
+
+    vis_fmt.format(&builder.writer) catch |err| {
+        std.log.warn("failed to format viewport snapshot err={s}", .{@errorName(err)});
+        return null;
+    };
+
+    const output = builder.writer.buffered();
+    if (output.len == 0) return null;
+
+    return alloc.dupe(u8, output) catch |err| {
+        std.log.warn("failed to allocate viewport snapshot err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -590,6 +652,14 @@ pub const HistoryFormat = enum(u8) {
     vt = 1,
     html = 2,
 };
+
+pub fn serializeTerminalHistory(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    format: HistoryFormat,
+) ?[]const u8 {
+    return serializeTerminal(alloc, term, format);
+}
 
 pub fn serializeTerminal(
     alloc: std.mem.Allocator,
@@ -966,6 +1036,30 @@ test "isCtrlBackslash" {
 
     // Other CSI u sequences that happen to contain '92' elsewhere
     try expect(!isCtrlBackslash("\x1b[65;92u"));
+}
+
+test "serializeViewportSnapshot excludes scrollback replay" {
+    const alloc = testing.allocator;
+
+    var term = try testCreateTerminal(alloc, 40, 5, "");
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    for (0..12) |i| {
+        var buf: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "SCROLL_{d}\r\n", .{i}) catch unreachable;
+        stream.nextSlice(line);
+    }
+    stream.nextSlice("\x1b[2J\x1b[2;4HVISIBLE_MARK\x1b[4;1H");
+
+    const snapshot = serializeViewportSnapshot(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(snapshot);
+
+    try testing.expect(std.mem.indexOf(u8, snapshot, "VISIBLE_MARK") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "SCROLL_0") == null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "SCROLL_11") == null);
 }
 
 test "serializeTerminalState excludes synchronized output replay" {

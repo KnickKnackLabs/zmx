@@ -18,9 +18,14 @@ pub const Tag = enum(u8) {
     Switch = 11,
     Write = 12,
     TaskComplete = 13,
+    ViewportSnapshot = 14,
+    LiveOutput = 15,
+    HistoryChunk = 16,
+    HistoryEnd = 17,
+    ControlInit = 18,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (14-255) are representable
-    // rather than UB. Switches must handle `_` (unknown tag).
+    // @enumFromInt, so out-of-range values (19-255) are representable
+    // rather than UB. Switches must handle `_` or `else` (unknown tag).
     _,
 };
 
@@ -260,11 +265,13 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },  .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 }, .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },   .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },    .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 },
+        .{ Tag.Input, 0 },        .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },       .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },         .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },          .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },       .{ Tag.TaskComplete, 13 }, .{ Tag.ViewportSnapshot, 14 },
+        .{ Tag.LiveOutput, 15 },  .{ Tag.HistoryChunk, 16 }, .{ Tag.HistoryEnd, 17 },
+        .{ Tag.ControlInit, 18 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

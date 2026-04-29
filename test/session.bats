@@ -58,8 +58,22 @@ load test_helper
   run bash -c 'env ZMX_DIR="$1" timeout 5 "$0" control --rows 24 --cols 80 control-immediate /bin/echo bats-control-startup | od -An -tx1 | tr -d " \n"' "$ZMX" "$ZMX_DIR"
   [ "$status" -eq 0 ]
   # Hex for "bats-control-startup". The control stream is binary-framed,
-  # so assert on hex rather than raw shell-captured bytes.
+  # so assert on hex rather than raw shell-captured bytes. Command output is
+  # live PTY output, so the first frame tag must be 0f (LiveOutput), not the
+  # legacy 01 (Output) frame.
+  [[ "$output" == 0f* ]]
   [[ "$output" == *"626174732d636f6e74726f6c2d73746172747570"* ]]
+}
+
+@test "control: existing session starts with viewport snapshot" {
+  "$ZMX" run control-viewport -d /bin/echo viewport-seed
+  wait_for_session control-viewport
+  sleep 0.5
+
+  run bash -c 'env ZMX_DIR="$1" timeout 1 "$0" control --rows 10 --cols 40 control-viewport | od -An -tx1 | tr -d " \n"' "$ZMX" "$ZMX_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == 0e* ]]
+  [[ "$output" == *"76696577706f72742d73656564"* ]]
 }
 
 # ============================================================================
