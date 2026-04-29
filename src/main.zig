@@ -2820,6 +2820,19 @@ fn appendAllowedControlOutput(alloc: std.mem.Allocator, out: *std.ArrayList(u8),
     }
 }
 
+fn flushControlStdoutBuffer(alloc: std.mem.Allocator, stdout_buf: *std.ArrayList(u8)) !void {
+    while (stdout_buf.items.len > 0) {
+        const n = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
+            if (err == error.WouldBlock) {
+                std.Thread.sleep(std.time.ns_per_ms);
+                break :blk 0;
+            }
+            return err;
+        };
+        if (n > 0) try stdout_buf.replaceRange(alloc, 0, n, &[_]u8{});
+    }
+}
+
 const ControlLoopOptions = struct {
     replay_initial_history: bool = false,
     drain_after_stdin_eof: bool = false,
@@ -2922,7 +2935,10 @@ fn controlLoop(
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) return;
                 return err;
             };
-            if (n == 0) return;
+            if (n == 0) {
+                try flushControlStdoutBuffer(alloc, &stdout_buf);
+                return;
+            }
             while (socket_read_buf.next()) |msg| {
                 try appendAllowedControlOutput(alloc, &stdout_buf, msg);
             }
@@ -2947,7 +2963,10 @@ fn controlLoop(
             }
         }
 
-        if (poll_fds.items[socket_index].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) return;
+        if (poll_fds.items[socket_index].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            try flushControlStdoutBuffer(alloc, &stdout_buf);
+            return;
+        }
     }
 }
 
