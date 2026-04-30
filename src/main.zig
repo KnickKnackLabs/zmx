@@ -2407,6 +2407,9 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
                         },
                         .Output => {
                             if (msg.payload.len > 0) {
+                                if (is_run_cmd and task_complete_code == null) {
+                                    task_complete_code = util.findTaskExitMarker(msg.payload);
+                                }
                                 // Strip the first line: it's the shell's
                                 // echo of the command we just submitted.
                                 if (!detached and is_run_cmd and is_first_line) {
