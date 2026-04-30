@@ -25,12 +25,20 @@ def frames_to_text(data: bytes) -> str:
     return out.decode("utf-8", errors="backslashreplace")
 
 
-def python_probe_code(query: Optional[str], split: bool) -> str:
-    if split:
+def escaped_bytes(text: str) -> bytes:
+    return text.encode("utf-8").decode("unicode_escape").encode("latin1")
+
+
+def python_probe_code(query: Optional[str], split: bool, chunks: list[str]) -> str:
+    if chunks:
+        writes = "; time.sleep(0.05); ".join(
+            f"os.write(1, {escaped_bytes(chunk)!r})" for chunk in chunks
+        )
+    elif split:
         writes = "os.write(1, b'\\x1b['); time.sleep(0.05); os.write(1, b'c')"
     else:
         assert query is not None
-        query_bytes = query.encode("utf-8").decode("unicode_escape").encode("latin1")
+        query_bytes = escaped_bytes(query)
         writes = f"os.write(1, {query_bytes!r})"
     return textwrap.dedent(
         f"""
@@ -71,14 +79,16 @@ def main() -> int:
     parser.add_argument("--session", required=True)
     parser.add_argument("--query")
     parser.add_argument("--split", action="store_true")
+    parser.add_argument("--chunk", action="append", default=[])
     parser.add_argument("--expect")
     parser.add_argument("--expect-regex")
+    parser.add_argument("--expect-text", action="append", default=[])
     args = parser.parse_args()
 
     zmx = os.environ["ZMX"]
     env = os.environ.copy()
     env.setdefault("SHELL", "/bin/bash")
-    code = python_probe_code(args.query, args.split)
+    code = python_probe_code(args.query, args.split, args.chunk)
     if args.mode == "control":
         cmd = [zmx, "control", "--rows", "24", "--cols", "80", args.session, "python3", "-c", code]
     else:
@@ -90,11 +100,19 @@ def main() -> int:
     got = extract_hex(text)
     print(text)
     print(f"GOT_HEX={got!r}")
+    ok = True
     if args.expect is not None:
-        return 0 if got == args.expect else 1
-    if args.expect_regex is not None:
-        return 0 if got is not None and re.fullmatch(args.expect_regex, got) else 1
-    parser.error("one of --expect or --expect-regex is required")
+        ok = ok and got == args.expect
+    elif args.expect_regex is not None:
+        ok = ok and got is not None and re.fullmatch(args.expect_regex, got) is not None
+    else:
+        parser.error("one of --expect or --expect-regex is required")
+
+    for expected_text in args.expect_text:
+        if expected_text not in text:
+            print(f"MISSING_TEXT={expected_text!r}")
+            ok = False
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

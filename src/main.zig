@@ -610,11 +610,23 @@ pub fn main() !void {
                 sessions.deinit(alloc);
             }
 
+            var matched_count: usize = 0;
+            var completed_count: usize = 0;
+            var completed_exit_code: u8 = 0;
+
             var fds = try std.ArrayList(i32).initCapacity(alloc, sessions.items.len);
             defer fds.deinit(alloc);
             for (sessions.items) |session| {
                 for (matchers.items) |m| {
                     if (!m.matches(session.name)) continue;
+                    matched_count += 1;
+                    if (!session.is_error and (session.task_ended_at orelse 0) > 0) {
+                        completed_count += 1;
+                        if ((session.task_exit_code orelse 0) != 0) {
+                            completed_exit_code = session.task_exit_code orelse 0;
+                        }
+                        break;
+                    }
                     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session.name) catch |err| switch (err) {
                         error.NameTooLong => continue,
                         else => return err,
@@ -628,11 +640,15 @@ pub fn main() !void {
                     break;
                 }
             }
+            if (matched_count == 0) return error.SessionNotFound;
+            if (completed_count == matched_count) {
+                posix.exit(completed_exit_code);
+            }
             if (fds.items.len == 0) return error.SessionNotFound;
             defer for (fds.items) |fd| posix.close(fd);
 
             const exit_code = try tail(fds, false, false);
-            posix.exit(exit_code);
+            posix.exit(if (exit_code != 0) exit_code else completed_exit_code);
         },
 
         .kill => {
@@ -2361,13 +2377,27 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
     var task_marker_buf = try std.ArrayList(u8).initCapacity(alloc, 128);
     defer task_marker_buf.deinit(alloc);
 
+    var active_fds = try std.ArrayList(i32).initCapacity(alloc, client_socket_fds.items.len);
+    defer active_fds.deinit(alloc);
+    try active_fds.appendSlice(alloc, client_socket_fds.items);
+
+    var completed_fds = try std.ArrayList(i32).initCapacity(alloc, client_socket_fds.items.len);
+    defer completed_fds.deinit(alloc);
+    var completed_codes = try std.ArrayList(u8).initCapacity(alloc, client_socket_fds.items.len);
+    defer completed_codes.deinit(alloc);
+
     var is_first_line = true;
     var task_complete_code: ?u8 = null;
+    var aggregate_exit_code: u8 = 0;
+    const post_task_idle_drain_ns: i128 = 50 * std.time.ns_per_ms;
+    const post_task_max_drain_ns: i128 = 500 * std.time.ns_per_ms;
+    var post_task_idle_deadline_ns: ?i128 = null;
+    var post_task_max_deadline_ns: ?i128 = null;
 
     while (true) {
         poll_fds.clearRetainingCapacity();
 
-        for (client_socket_fds.items) |client_sock_fd| {
+        for (active_fds.items) |client_sock_fd| {
             try poll_fds.append(alloc, .{
                 .fd = client_sock_fd,
                 .events = posix.POLL.IN,
@@ -2383,7 +2413,17 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
             });
         }
 
-        _ = posix.poll(poll_fds.items, -1) catch |err| {
+        var poll_timeout_ms: i32 = -1;
+        if (post_task_idle_deadline_ns) |idle_deadline| {
+            const now = std.time.nanoTimestamp();
+            const max_deadline = post_task_max_deadline_ns orelse idle_deadline;
+            const deadline = @min(idle_deadline, max_deadline);
+            if (stdout_buf.items.len == 0 and now >= deadline) return aggregate_exit_code;
+            const remaining_ns = @max(@as(i128, 0), deadline - now);
+            poll_timeout_ms = @intCast(@max(@as(i128, 1), @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        }
+
+        _ = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
             if (err == error.Interrupted) continue;
             return err;
         };
@@ -2410,6 +2450,9 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
                         },
                         .Output => {
                             if (msg.payload.len > 0) {
+                                if (post_task_idle_deadline_ns != null) {
+                                    post_task_idle_deadline_ns = std.time.nanoTimestamp() + post_task_idle_drain_ns;
+                                }
                                 if (is_run_cmd and task_complete_code == null) {
                                     try task_marker_buf.appendSlice(alloc, msg.payload);
                                     task_complete_code = util.findTaskExitMarker(task_marker_buf.items);
@@ -2437,7 +2480,12 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
                             }
                         },
                         .TaskComplete => {
-                            task_complete_code = if (msg.payload.len > 0) msg.payload[0] else 0;
+                            const exit_code = if (msg.payload.len > 0) msg.payload[0] else 0;
+                            task_complete_code = exit_code;
+                            if (std.mem.indexOfScalar(i32, completed_fds.items, poll_fd.fd) == null) {
+                                try completed_fds.append(alloc, poll_fd.fd);
+                                try completed_codes.append(alloc, exit_code);
+                            }
                         },
                         else => {},
                     }
@@ -2455,15 +2503,32 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
             }
         }
 
-        if (stdout_buf.items.len == 0) {
-            if (task_complete_code) |exit_code| {
-                return exit_code;
+        if (stdout_buf.items.len == 0 and completed_fds.items.len > 0) {
+            for (completed_fds.items, completed_codes.items) |completed_fd, exit_code| {
+                if (exit_code != 0) aggregate_exit_code = exit_code;
+                if (is_run_cmd) {
+                    if (post_task_idle_deadline_ns == null) {
+                        const now = std.time.nanoTimestamp();
+                        post_task_idle_deadline_ns = now + post_task_idle_drain_ns;
+                        post_task_max_deadline_ns = now + post_task_max_drain_ns;
+                    }
+                    continue;
+                }
+                if (std.mem.indexOfScalar(i32, active_fds.items, completed_fd)) |idx| {
+                    try active_fds.replaceRange(alloc, idx, 1, &[_]i32{});
+                }
             }
+            completed_fds.clearRetainingCapacity();
+            completed_codes.clearRetainingCapacity();
+            if (!is_run_cmd and active_fds.items.len == 0) return aggregate_exit_code;
         }
 
         for (poll_fds.items) |poll_fd| {
             if (poll_fd.revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-                return 0;
+                if (std.mem.indexOfScalar(i32, active_fds.items, poll_fd.fd)) |idx| {
+                    try active_fds.replaceRange(alloc, idx, 1, &[_]i32{});
+                }
+                if (active_fds.items.len == 0) return aggregate_exit_code;
             }
         }
     }

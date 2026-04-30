@@ -274,6 +274,19 @@ test "terminal query responder: ignores terminal responses" {
     try expectTerminalQueryResponse("\x1b[12;34R", "");
 }
 
+test "terminal query responder: abandons non-query CSI prefixes" {
+    try expectSplitTerminalQueryResponse("\x1b[", "x\x1b[c", DA1_RESPONSE);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(std.testing.allocator);
+    respondToTerminalQueries(std.testing.allocator, &buf, &pending, "\x1b[", 12, 34);
+    respondToTerminalQueries(std.testing.allocator, &buf, &pending, "x", 12, 34);
+    respondToTerminalQueries(std.testing.allocator, &buf, &pending, "\x1b[c", 12, 34);
+    try std.testing.expectEqualStrings(DA1_RESPONSE, buf.items);
+}
+
 /// OSC 133;A (prompt start) marker.
 const OSC_133_A = "\x1b]133;A";
 
@@ -304,11 +317,11 @@ pub fn rewritePromptRedraw(alloc: std.mem.Allocator, data: []const u8) ?[]const 
         const after = pos + OSC_133_A.len;
         if (after >= result.items.len) continue;
 
-        // Find the string terminator (BEL \x07 or ST \x1b\\).
+        // Find the string terminator (BEL \x07, 7-bit ST \x1b\\, or C1 ST \x9c).
         var term_pos: ?usize = null;
         var j = after;
         while (j < result.items.len) : (j += 1) {
-            if (result.items[j] == '\x07') {
+            if (result.items[j] == '\x07' or result.items[j] == '\x9c') {
                 term_pos = j;
                 break;
             }
@@ -322,16 +335,13 @@ pub fn rewritePromptRedraw(alloc: std.mem.Allocator, data: []const u8) ?[]const 
         // Check the parameter region between OSC_133_A and the terminator.
         const params = result.items[after..end];
 
-        // If redraw=0 already present, skip.
-        if (std.mem.indexOf(u8, params, "redraw=0") != null) continue;
-
-        // If redraw= exists with a different value, replace it.
-        if (std.mem.indexOf(u8, params, "redraw=")) |rdw_offset| {
-            const abs_rdw = after + rdw_offset;
-            const value_start = abs_rdw + "redraw=".len;
-            var value_end = value_start;
-            while (value_end < end and result.items[value_end] != ';') : (value_end += 1) {}
-            result.replaceRange(alloc, value_start, value_end - value_start, "0") catch return null;
+        // If redraw= is already present, only preserve an exact redraw=0
+        // parameter. Do not let values like redraw=01 or aid=redraw=0 suppress
+        // the rewrite.
+        if (findRedrawParam(params)) |rdw| {
+            if (rdw.is_zero) continue;
+            const value_start = after + rdw.value_start;
+            result.replaceRange(alloc, value_start, rdw.value_end - rdw.value_start, "0") catch return null;
             continue;
         }
 
@@ -346,6 +356,33 @@ pub fn rewritePromptRedraw(alloc: std.mem.Allocator, data: []const u8) ?[]const 
     }
 
     return result.toOwnedSlice(alloc) catch null;
+}
+
+const RedrawParam = struct {
+    value_start: usize,
+    value_end: usize,
+    is_zero: bool,
+};
+
+fn findRedrawParam(params: []const u8) ?RedrawParam {
+    var start: usize = 0;
+    while (start <= params.len) {
+        var end = start;
+        while (end < params.len and params[end] != ';') : (end += 1) {}
+        const param = params[start..end];
+        if (std.mem.startsWith(u8, param, "redraw=")) {
+            const value_start = start + "redraw=".len;
+            const value = params[value_start..end];
+            return .{
+                .value_start = value_start,
+                .value_end = end,
+                .is_zero = std.mem.eql(u8, value, "0"),
+            };
+        }
+        if (end == params.len) break;
+        start = end + 1;
+    }
+    return null;
 }
 
 test "rewritePromptRedraw: no OSC 133;A returns null" {
@@ -367,6 +404,13 @@ test "rewritePromptRedraw: injects redraw=0 with ST terminator" {
     try std.testing.expectEqualStrings("\x1b]133;A;redraw=0\x1b\\", result);
 }
 
+test "rewritePromptRedraw: injects redraw=0 with C1 ST terminator" {
+    const input = "\x1b]133;A\x9c";
+    const result = rewritePromptRedraw(std.testing.allocator, input).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\x1b]133;A;redraw=0\x9c", result);
+}
+
 test "rewritePromptRedraw: replaces existing redraw=1" {
     const input = "\x1b]133;A;redraw=1\x07";
     const result = rewritePromptRedraw(std.testing.allocator, input).?;
@@ -386,6 +430,20 @@ test "rewritePromptRedraw: preserves redraw=0 (no-op)" {
     try std.testing.expect(result == null);
 }
 
+test "rewritePromptRedraw: treats redraw=0 as exact parameter" {
+    const input = "\x1b]133;A;redraw=01\x07";
+    const result = rewritePromptRedraw(std.testing.allocator, input).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\x1b]133;A;redraw=0\x07", result);
+}
+
+test "rewritePromptRedraw: ignores redraw=0 inside other parameter values" {
+    const input = "\x1b]133;A;aid=redraw=0\x07";
+    const result = rewritePromptRedraw(std.testing.allocator, input).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\x1b]133;A;aid=redraw=0;redraw=0\x07", result);
+}
+
 test "rewritePromptRedraw: preserves other parameters" {
     const input = "\x1b]133;A;aid=14;cl=line\x07";
     const result = rewritePromptRedraw(std.testing.allocator, input).?;
@@ -398,6 +456,13 @@ test "rewritePromptRedraw: handles multiple markers" {
     const result = rewritePromptRedraw(std.testing.allocator, input).?;
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("before\x1b]133;A;redraw=0\x07middle\x1b]133;A;redraw=0\x07after", result);
+}
+
+test "rewritePromptRedraw: handles adjacent mixed terminator markers" {
+    const input = "\x1b]133;A\x07\x1b]133;A;redraw=1\x1b\\\x1b]133;A;aid=7\x9c";
+    const result = rewritePromptRedraw(std.testing.allocator, input).?;
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\x1b]133;A;redraw=0\x07\x1b]133;A;redraw=0\x1b\\\x1b]133;A;aid=7;redraw=0\x9c", result);
 }
 
 test "rewritePromptRedraw: does not touch OSC 133;B or 133;C" {
@@ -419,7 +484,17 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
     var offset: usize = 0;
     while (offset < output.len) {
         const idx = std.mem.indexOf(u8, output[offset..], marker) orelse return null;
-        const after_marker = output[offset + idx + marker.len ..];
+        const marker_start = offset + idx;
+        var line_start = marker_start;
+        while (line_start > 0 and output[line_start - 1] != '\n' and output[line_start - 1] != '\r') {
+            line_start -= 1;
+        }
+        if (!isAnsiOnly(output[line_start..marker_start])) {
+            offset = marker_start + marker.len;
+            continue;
+        }
+
+        const after_marker = output[marker_start + marker.len ..];
 
         // Find the exit code number and newline
         var end_idx: usize = 0;
@@ -432,9 +507,9 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
         // Shells echo the submitted command before running it, which can expose
         // the literal marker template (for example `ZMX_TASK_COMPLETED:$?`).
         // Keep scanning until we find the marker emitted with a numeric code.
-        if (std.fmt.parseInt(u8, exit_code_str, 10)) |exit_code| {
+        if (parseTaskExitCode(exit_code_str)) |exit_code| {
             return exit_code;
-        } else |_| {
+        } else {
             offset += idx + marker.len;
         }
     }
@@ -442,11 +517,68 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
     return null;
 }
 
+fn isAnsiOnly(data: []const u8) bool {
+    var i: usize = 0;
+    while (i < data.len) {
+        if (i + 2 > data.len or data[i] != '\x1b' or data[i + 1] != '[') return false;
+        i += 2;
+        while (i < data.len) : (i += 1) {
+            if (data[i] >= 0x40 and data[i] <= 0x7e) {
+                i += 1;
+                break;
+            }
+        } else return false;
+    }
+    return true;
+}
+
+fn parseTaskExitCode(data: []const u8) ?u8 {
+    var digits: [3]u8 = undefined;
+    var digits_len: usize = 0;
+
+    var i: usize = 0;
+    while (i < data.len) {
+        if (data[i] == '\x1b' and i + 1 < data.len and data[i + 1] == '[') {
+            i += 2;
+            while (i < data.len) : (i += 1) {
+                if (data[i] >= 0x40 and data[i] <= 0x7e) {
+                    i += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (data[i] < '0' or data[i] > '9') return null;
+        if (digits_len == digits.len) return null;
+        digits[digits_len] = data[i];
+        digits_len += 1;
+        i += 1;
+    }
+
+    if (digits_len == 0) return null;
+    return std.fmt.parseInt(u8, digits[0..digits_len], 10) catch null;
+}
+
 test "findTaskExitMarker skips echoed marker template" {
     try std.testing.expectEqual(
         @as(?u8, 0),
         findTaskExitMarker("echo ZMX_TASK_COMPLETED:$?\r\nhello\r\nZMX_TASK_COMPLETED:0\r\n"),
     );
+}
+
+test "findTaskExitMarker handles practical marker variants" {
+    try std.testing.expectEqual(@as(?u8, 7), findTaskExitMarker("ZMX_TASK_COMPLETED:7\r"));
+    try std.testing.expectEqual(@as(?u8, 1), findTaskExitMarker("\x1b[31mZMX_TASK_COMPLETED:1\r\n"));
+    try std.testing.expectEqual(
+        @as(?u8, 2),
+        findTaskExitMarker("ZMX_TASK_COMPLETED:$?\r\nZMX_TASK_COMPLETED:$status\r\nZMX_TASK_COMPLETED:2\r\n"),
+    );
+    try std.testing.expectEqual(@as(?u8, 3), findTaskExitMarker("progress 90%\rZMX_TASK_COMPLETED:3\r\n"));
+    try std.testing.expectEqual(@as(?u8, 4), findTaskExitMarker("ZMX_TASK_COMPLETED:\x1b[32m4\x1b[0m\r\n"));
+    try std.testing.expectEqual(@as(?u8, 5), findTaskExitMarker("ZMX_TASK_COMPLETED:999\r\nZMX_TASK_COMPLETED:5\r\n"));
+    try std.testing.expectEqual(@as(?u8, 6), findTaskExitMarker("NOT_ZMX_TASK_COMPLETED:0\r\nZMX_TASK_COMPLETED:6\r\n"));
+    try std.testing.expectEqual(@as(?u8, 8), findTaskExitMarker("\x1b[1m\x1b[32mZMX_TASK_COMPLETED:8\r\n"));
 }
 
 /// Detects Kitty keyboard protocol escape sequence for Ctrl+\.
