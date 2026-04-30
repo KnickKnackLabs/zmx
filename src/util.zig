@@ -416,9 +416,10 @@ test "rewritePromptRedraw: embedded in larger output" {
 pub fn findTaskExitMarker(output: []const u8) ?u8 {
     const marker = "ZMX_TASK_COMPLETED:";
 
-    // Search for marker in output
-    if (std.mem.indexOf(u8, output, marker)) |idx| {
-        const after_marker = output[idx + marker.len ..];
+    var offset: usize = 0;
+    while (offset < output.len) {
+        const idx = std.mem.indexOf(u8, output[offset..], marker) orelse return null;
+        const after_marker = output[offset + idx + marker.len ..];
 
         // Find the exit code number and newline
         var end_idx: usize = 0;
@@ -428,16 +429,24 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
 
         const exit_code_str = after_marker[0..end_idx];
 
-        // Parse exit code
+        // Shells echo the submitted command before running it, which can expose
+        // the literal marker template (for example `ZMX_TASK_COMPLETED:$?`).
+        // Keep scanning until we find the marker emitted with a numeric code.
         if (std.fmt.parseInt(u8, exit_code_str, 10)) |exit_code| {
             return exit_code;
         } else |_| {
-            std.log.warn("failed to parse task exit code from: {s}", .{exit_code_str});
-            return null;
+            offset += idx + marker.len;
         }
     }
 
     return null;
+}
+
+test "findTaskExitMarker skips echoed marker template" {
+    try std.testing.expectEqual(
+        @as(?u8, 0),
+        findTaskExitMarker("echo ZMX_TASK_COMPLETED:$?\r\nhello\r\nZMX_TASK_COMPLETED:0\r\n"),
+    );
 }
 
 /// Detects Kitty keyboard protocol escape sequence for Ctrl+\.
