@@ -2358,6 +2358,9 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
     var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
     defer stdout_buf.deinit(alloc);
 
+    var task_marker_buf = try std.ArrayList(u8).initCapacity(alloc, 128);
+    defer task_marker_buf.deinit(alloc);
+
     var is_first_line = true;
     var task_complete_code: ?u8 = null;
 
@@ -2408,7 +2411,16 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
                         .Output => {
                             if (msg.payload.len > 0) {
                                 if (is_run_cmd and task_complete_code == null) {
-                                    task_complete_code = util.findTaskExitMarker(msg.payload);
+                                    try task_marker_buf.appendSlice(alloc, msg.payload);
+                                    task_complete_code = util.findTaskExitMarker(task_marker_buf.items);
+                                    if (task_complete_code == null and task_marker_buf.items.len > 128) {
+                                        try task_marker_buf.replaceRange(
+                                            alloc,
+                                            0,
+                                            task_marker_buf.items.len - 128,
+                                            &[_]u8{},
+                                        );
+                                    }
                                 }
                                 // Strip the first line: it's the shell's
                                 // echo of the command we just submitted.
