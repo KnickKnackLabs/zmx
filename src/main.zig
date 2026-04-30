@@ -2435,11 +2435,14 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
                 if (err == error.WouldBlock) break :blk 0;
                 return err;
             };
-            if (task_complete_code) |exit_code| {
-                return exit_code;
-            }
             if (n > 0) {
                 try stdout_buf.replaceRange(alloc, 0, n, &[_]u8{});
+            }
+        }
+
+        if (stdout_buf.items.len == 0) {
+            if (task_complete_code) |exit_code| {
+                return exit_code;
             }
         }
 
