@@ -785,6 +785,10 @@ const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     kind: ClientKind = .terminal,
+    // True only for real terminal clients that can send terminal-query
+    // responses back to the PTY via Input frames. Control/tail clients consume
+    // rendered output but do not answer PTY-side terminal queries.
+    responds_to_terminal_queries: bool = false,
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -894,7 +898,6 @@ const Daemon = struct {
     cwd: []const u8 = "",
     has_pty_output: bool = false,
     has_had_client: bool = false,
-    has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
@@ -903,6 +906,7 @@ const Daemon = struct {
     is_fish: bool = false, // true if the session's foreground shell is fish
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    terminal_query_pending: std.ArrayList(u8) = .empty,
     start_child_on_init: bool = false,
     child_start_fd: posix.fd_t = -1,
 
@@ -910,6 +914,7 @@ const Daemon = struct {
         self.closeChildStartFd();
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
+        self.terminal_query_pending.deinit(self.alloc);
         self.alloc.free(self.socket_path);
     }
 
@@ -955,6 +960,13 @@ const Daemon = struct {
             self.alloc.destroy(client);
         }
         self.clients.clearRetainingCapacity();
+    }
+
+    fn hasTerminalQueryResponder(self: *const Daemon) bool {
+        for (self.clients.items) |client| {
+            if (client.responds_to_terminal_queries) return true;
+        }
+        return false;
     }
 
     pub fn closeClient(self: *Daemon, client: *Client, i: usize, shutdown_on_last: bool) bool {
@@ -1343,11 +1355,11 @@ const Daemon = struct {
 
         try self.applyClientResize(pty_fd, term, resize);
 
-        // Mark that we've had a client init, so subsequent clients get terminal state
-        // (KKL flattened the `if has_had_client` wrapper). has_terminal_client
-        // gates DA-query relay (upstream c654778).
+        // Mark that a real terminal client has initialized. Only real terminal
+        // clients can answer terminal queries from the PTY; control clients
+        // receive rendered frames and must not suppress daemon-side responses.
+        client.responds_to_terminal_queries = true;
         self.has_had_client = true;
-        self.has_terminal_client = true;
         self.releaseChildStart();
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
@@ -1412,7 +1424,6 @@ const Daemon = struct {
 
         try self.applyClientResize(pty_fd, term, resize);
         self.has_had_client = true;
-        self.has_terminal_client = true;
         self.releaseChildStart();
 
         std.log.debug("control init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
@@ -3249,16 +3260,23 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
 
-                    // When no real terminal client has attached yet, respond to
-                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents fish from waiting 10s for unanswered queries.
-                    // `has_terminal_client` is only set when a client sends .Init
-                    // (a real zmx attach), not when a `zmx run` tail-only client
-                    // connects.
-                    if (!daemon.has_terminal_client and
+                    // When no real terminal client is attached, respond to
+                    // terminal queries on behalf of the terminal. Control clients
+                    // consume rendered frames but cannot answer PTY queries, and
+                    // tail-only clients (`zmx run`) are not terminal emulators.
+                    if (!daemon.hasTerminalQueryResponder() and
+                        (daemon.clients.items.len == 0 or daemon.has_had_client) and
                         daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
                     {
-                        util.respondToDeviceAttributes(daemon.alloc, &daemon.pty_write_buf, buf[0..n]);
+                        const cursor = term.screens.active.cursor;
+                        util.respondToTerminalQueries(
+                            daemon.alloc,
+                            &daemon.pty_write_buf,
+                            &daemon.terminal_query_pending,
+                            buf[0..n],
+                            @as(usize, @intCast(cursor.y)) + 1,
+                            @as(usize, @intCast(cursor.x)) + 1,
+                        );
                     }
 
                     // In run mode, scan output for exit code marker

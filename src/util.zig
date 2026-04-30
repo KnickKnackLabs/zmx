@@ -143,45 +143,135 @@ const DA1_QUERY = "\x1b[c";
 const DA1_QUERY_EXPLICIT = "\x1b[0c";
 const DA2_QUERY = "\x1b[>c";
 const DA2_QUERY_EXPLICIT = "\x1b[>0c";
+const DSR_STATUS_QUERY = "\x1b[5n";
+const CPR_QUERY = "\x1b[6n";
 const DA1_RESPONSE = "\x1b[?62;22c";
 const DA2_RESPONSE = "\x1b[>1;10;0c";
+const DSR_STATUS_RESPONSE = "\x1b[0n";
 
-pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) void {
-    // Scan for DA queries in PTY output and respond on behalf of the terminal.
-    // This handles the case where no client is attached (e.g. zmx run)
-    // and the shell (e.g. fish) sends a DA query that would otherwise go unanswered.
+const TERMINAL_QUERY_PREFIXES = [_][]const u8{
+    DA1_QUERY,
+    DA1_QUERY_EXPLICIT,
+    DA2_QUERY,
+    DA2_QUERY_EXPLICIT,
+    DSR_STATUS_QUERY,
+    CPR_QUERY,
+};
+const MAX_TERMINAL_QUERY_PREFIX_LEN = terminalQueryPrefixLen();
+
+pub fn respondToTerminalQueries(
+    alloc: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    pending: *std.ArrayList(u8),
+    data: []const u8,
+    cursor_row: usize,
+    cursor_col: usize,
+) void {
+    // Scan for terminal queries in PTY output and respond on behalf of the
+    // terminal when no real terminal client is currently attached. Responses are
+    // queued into the daemon's pty_write_buf (not written directly), so they
+    // preserve ordering with any already-buffered input.
     //
-    // Responses are queued into the daemon's pty_write_buf (not written
-    // directly) so they don't interleave with any already-buffered input —
-    // e.g. a large `zmx run` payload still draining after the client
-    // disconnected.
-    //
-    // DA1 query: ESC [ c  or  ESC [ 0 c
-    // DA2 query: ESC [ > c  or  ESC [ > 0 c
-    // DA1 response (from terminal): ESC [ ? ... c  (has '?' after '[')
-    //
-    // We must NOT match DA responses (which contain '?') as queries.
+    // Keep a tiny suffix buffer so queries split across PTY reads are still
+    // recognized without introducing a full parser or retaining arbitrary data.
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(alloc);
+
+    const scan_data = blk: {
+        if (pending.items.len == 0) break :blk data;
+        combined.appendSlice(alloc, pending.items) catch break :blk data;
+        combined.appendSlice(alloc, data) catch break :blk data;
+        pending.clearRetainingCapacity();
+        break :blk combined.items;
+    };
+
     var i: usize = 0;
-    while (i < data.len) {
-        if (data[i] == '\x1b' and i + 1 < data.len and data[i + 1] == '[') {
-            // Skip DA responses which have '?' after CSI
-            if (i + 2 < data.len and data[i + 2] == '?') {
-                i += 3;
-                continue;
-            }
-            if (matchSeq(data[i..], DA2_QUERY) or matchSeq(data[i..], DA2_QUERY_EXPLICIT)) {
-                buf.appendSlice(alloc, DA2_RESPONSE) catch {};
-            } else if (matchSeq(data[i..], DA1_QUERY) or matchSeq(data[i..], DA1_QUERY_EXPLICIT)) {
-                buf.appendSlice(alloc, DA1_RESPONSE) catch {};
-            }
+    while (i < scan_data.len) {
+        if (matchSeq(scan_data[i..], DA2_QUERY) or matchSeq(scan_data[i..], DA2_QUERY_EXPLICIT)) {
+            buf.appendSlice(alloc, DA2_RESPONSE) catch {};
+        } else if (matchSeq(scan_data[i..], DA1_QUERY) or matchSeq(scan_data[i..], DA1_QUERY_EXPLICIT)) {
+            buf.appendSlice(alloc, DA1_RESPONSE) catch {};
+        } else if (matchSeq(scan_data[i..], DSR_STATUS_QUERY)) {
+            buf.appendSlice(alloc, DSR_STATUS_RESPONSE) catch {};
+        } else if (matchSeq(scan_data[i..], CPR_QUERY)) {
+            // Cursor position reflects ghostty-vt state after the current PTY
+            // chunk is applied. Shells normally query and then block, so this
+            // is precise for the stall cases this responder handles.
+            buf.writer(alloc).print("\x1b[{d};{d}R", .{ cursor_row, cursor_col }) catch {};
         }
         i += 1;
     }
+
+    rememberTerminalQueryPrefix(alloc, pending, scan_data);
+}
+
+fn rememberTerminalQueryPrefix(alloc: std.mem.Allocator, pending: *std.ArrayList(u8), data: []const u8) void {
+    pending.clearRetainingCapacity();
+    var suffix_len = @min(MAX_TERMINAL_QUERY_PREFIX_LEN, data.len);
+    while (suffix_len > 0) : (suffix_len -= 1) {
+        const suffix = data[data.len - suffix_len ..];
+        for (TERMINAL_QUERY_PREFIXES) |query| {
+            if (suffix.len < query.len and std.mem.eql(u8, suffix, query[0..suffix.len])) {
+                pending.appendSlice(alloc, suffix) catch {};
+                return;
+            }
+        }
+    }
+}
+
+fn terminalQueryPrefixLen() usize {
+    comptime var max_len: usize = 0;
+    inline for (TERMINAL_QUERY_PREFIXES) |query| {
+        max_len = @max(max_len, query.len - 1);
+    }
+    return max_len;
 }
 
 fn matchSeq(data: []const u8, seq: []const u8) bool {
     if (data.len < seq.len) return false;
     return std.mem.eql(u8, data[0..seq.len], seq);
+}
+
+fn expectTerminalQueryResponse(data: []const u8, expected: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(std.testing.allocator);
+    respondToTerminalQueries(std.testing.allocator, &buf, &pending, data, 12, 34);
+    try std.testing.expectEqualStrings(expected, buf.items);
+}
+
+fn expectSplitTerminalQueryResponse(first: []const u8, second: []const u8, expected: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(std.testing.allocator);
+    respondToTerminalQueries(std.testing.allocator, &buf, &pending, first, 12, 34);
+    respondToTerminalQueries(std.testing.allocator, &buf, &pending, second, 12, 34);
+    try std.testing.expectEqualStrings(expected, buf.items);
+}
+
+test "terminal query responder: DA variants" {
+    try expectTerminalQueryResponse("\x1b[c", DA1_RESPONSE);
+    try expectTerminalQueryResponse("\x1b[0c", DA1_RESPONSE);
+    try expectTerminalQueryResponse("\x1b[>c", DA2_RESPONSE);
+    try expectTerminalQueryResponse("\x1b[>0c", DA2_RESPONSE);
+}
+
+test "terminal query responder: split DA" {
+    try expectSplitTerminalQueryResponse("\x1b[", "c", DA1_RESPONSE);
+}
+
+test "terminal query responder: DSR and CPR" {
+    try expectTerminalQueryResponse("\x1b[5n", DSR_STATUS_RESPONSE);
+    try expectTerminalQueryResponse("\x1b[6n", "\x1b[12;34R");
+}
+
+test "terminal query responder: ignores terminal responses" {
+    try expectTerminalQueryResponse("\x1b[?62;22c", "");
+    try expectTerminalQueryResponse("\x1b[>1;10;0c", "");
+    try expectTerminalQueryResponse("\x1b[0n", "");
+    try expectTerminalQueryResponse("\x1b[12;34R", "");
 }
 
 /// OSC 133;A (prompt start) marker.
