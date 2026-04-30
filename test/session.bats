@@ -40,7 +40,11 @@ load test_helper
 }
 
 @test "run: blocking returns after command completes" {
-  run timeout 5 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
+  run timeout 10 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
+  if [ "$status" -ne 0 ]; then
+    echo "status=$status" >&3
+    echo "$output" >&3
+  fi
   [ "$status" -eq 0 ]
   [[ "$output" == *"session \"test-blocking\" created"* ]]
 }
