@@ -32,8 +32,8 @@ jobs:
       - name: Check for new upstream commits
         id: check
         run: |
-          LOCAL=$(git rev-parse upstream)
-          REMOTE=$(git rev-parse upstream/main)
+          LOCAL=$(git rev-parse refs/remotes/origin/upstream)
+          REMOTE=$(git rev-parse refs/remotes/upstream/main)
           if [ "$LOCAL" = "$REMOTE" ]; then
             echo "up-to-date=true" >> "$GITHUB_OUTPUT"
             echo "No new upstream commits"
@@ -46,28 +46,29 @@ jobs:
       - name: Fast-forward upstream branch
         if: steps.check.outputs.up-to-date == 'false'
         run: |
-          git merge --ff-only upstream/main
-          git push origin upstream
+          git checkout -B upstream refs/remotes/origin/upstream
+          git merge --ff-only refs/remotes/upstream/main
+          git push origin HEAD:upstream
           git push origin --tags
 
       - name: Rebase main onto upstream
         if: steps.check.outputs.up-to-date == 'false'
         run: |
-          git checkout main
-          git rebase upstream || {
+          git checkout -B main refs/remotes/origin/main
+          git rebase refs/remotes/upstream/main || {
             echo "::error::Rebase failed — manual intervention needed"
             git rebase --abort
             gh issue create \
               --title "Upstream sync: rebase conflict" \
               --body "Automatic rebase of main onto upstream failed. Manual rebase needed.
 
-          Upstream advanced to $(git rev-parse upstream/main).
+          Upstream advanced to $(git rev-parse refs/remotes/upstream/main).
 
           To resolve:
           \`\`\`bash
           git fetch origin
           git checkout main
-          git rebase origin/upstream
+          git rebase refs/remotes/upstream/main
           # resolve conflicts
           git push --force-with-lease origin main
           \`\`\`" \
