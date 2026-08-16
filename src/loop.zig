@@ -517,9 +517,20 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 };
 
                 client.write_head += n;
-                if (client.write_head == client.write_buf.items.len) {
-                    client.write_buf.clearRetainingCapacity();
-                    client.write_head = 0;
+                ipc.compactWrittenMessages(
+                    gpa,
+                    &client.write_buf,
+                    &client.write_head,
+                ) catch |err| {
+                    std.log.warn(
+                        "failed to compact client output err={s}",
+                        .{@errorName(err)},
+                    );
+                    const last = daemon.closeClient(gpa, client, i, false);
+                    if (last) break :daemon_loop;
+                    continue;
+                };
+                if (client.write_buf.items.len == 0) {
                     client.has_pending_output = false;
                 }
             }
