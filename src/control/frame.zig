@@ -110,7 +110,11 @@ pub fn appendInputAsIpc(
             try ipc.appendMessage(alloc, out, .Resize, std.mem.asBytes(&resize));
         },
         .close => try ipc.appendMessage(alloc, out, .Detach, ""),
-        .history => try ipc.appendMessage(alloc, out, .History, frame.payload),
+        .history => {
+            if (frame.payload.len > 1) return error.InvalidControlHistory;
+            if (frame.payload.len == 1 and frame.payload[0] > 2) return error.InvalidControlHistory;
+            try ipc.appendMessage(alloc, out, .History, frame.payload);
+        },
         else => return false,
     }
     return true;
@@ -169,6 +173,22 @@ test "external resize expands to current internal resize without reusing tags" {
     try std.testing.expectEqual(@as(u16, 120), resize.cols);
     try std.testing.expectEqual(@as(u16, 0), resize.xpixel);
     try std.testing.expectEqual(@as(u16, 0), resize.ypixel);
+}
+
+test "external history rejects malformed formats before internal IPC" {
+    const alloc = std.testing.allocator;
+    var internal = std.ArrayList(u8).empty;
+    defer internal.deinit(alloc);
+
+    try std.testing.expectError(
+        error.InvalidControlHistory,
+        appendInputAsIpc(alloc, &internal, .{ .tag = .history, .payload = &.{3} }),
+    );
+    try std.testing.expectError(
+        error.InvalidControlHistory,
+        appendInputAsIpc(alloc, &internal, .{ .tag = .history, .payload = &.{ 0, 1 } }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), internal.items.len);
 }
 
 test "output mapping keeps internal and external semantic tags separate" {
