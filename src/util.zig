@@ -746,6 +746,58 @@ fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
     };
 }
 
+/// Serialize only the active viewport for a semantic control client. Unlike
+/// full terminal restoration, this never replays scrollback into the adapter.
+pub fn serializeViewportSnapshot(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) term.modes.set(.synchronized_output, false);
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
+
+    var formatter = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    const pages = &term.screens.active.pages;
+    const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
+    const active_br = pages.pin(.{
+        .active = .{
+            .x = @intCast(pages.cols - 1),
+            .y = @intCast(pages.rows - 1),
+        },
+    });
+    if (active_tl != null and active_br != null) {
+        formatter.content = .{
+            .selection = ghostty_vt.Selection.init(active_tl.?, active_br.?, false),
+        };
+    }
+    formatter.extra = .{
+        .palette = false,
+        .modes = true,
+        .scrolling_region = true,
+        .tabstops = false,
+        .pwd = false,
+        .keyboard = true,
+        .screen = .all,
+    };
+    formatter.format(&builder.writer) catch |err| {
+        std.log.warn("failed to format viewport snapshot err={s}", .{@errorName(err)});
+        return null;
+    };
+    writePwd(&builder.writer, term);
+    if (term.getTitle()) |title| {
+        builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
+            std.log.warn("failed to format viewport title err={s}", .{@errorName(err)});
+        };
+    }
+
+    const output = builder.writer.buffered();
+    if (output.len == 0) return null;
+    return alloc.dupe(u8, output) catch |err| {
+        std.log.warn("failed to allocate viewport snapshot err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -1524,6 +1576,29 @@ test "toOsc7Cwd round-trips through parseOsc7Cwd" {
             return err;
         };
     }
+}
+
+test "serializeViewportSnapshot excludes scrollback replay" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try testCreateTerminal(alloc, io, 40, 5, "");
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    for (0..12) |i| {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "SCROLL_{d}\r\n", .{i});
+        stream.nextSlice(line);
+    }
+    stream.nextSlice("\x1b[2J\x1b[2;4HVISIBLE_MARK\x1b[4;1H");
+
+    const snapshot = serializeViewportSnapshot(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(snapshot);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "VISIBLE_MARK") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "SCROLL_0") == null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "SCROLL_11") == null);
 }
 
 test "serializeTerminalState excludes synchronized output replay" {

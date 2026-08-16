@@ -11,6 +11,7 @@ const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
+const control_daemon = @import("control/daemon.zig");
 const builtin = @import("builtin");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
@@ -388,13 +389,23 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
-                            std.log.warn(
-                                "failed to buffer output for client err={s}",
-                                .{@errorName(err)},
-                            );
-                            continue;
-                        };
+                        if (client.kind == .control) {
+                            control_daemon.queuePtyOutput(gpa, &client.write_buf, &term, broadcast_data) catch |err| {
+                                std.log.warn(
+                                    "failed to buffer control output err={s}",
+                                    .{@errorName(err)},
+                                );
+                                continue;
+                            };
+                        } else {
+                            ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
+                                std.log.warn(
+                                    "failed to buffer output for client err={s}",
+                                    .{@errorName(err)},
+                                );
+                                continue;
+                            };
+                        }
                         client.has_pending_output = true;
                     }
                 }
@@ -475,7 +486,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData => {},
+                        .ControlInit => try daemon.handleControlInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Ack, .TaskComplete, .LabelData, .ControlReady, .ControlViewport, .ControlLive, .ControlHistoryChunk, .ControlHistoryEnd => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -521,12 +533,18 @@ const ClientResult = struct {
     cwd: ?[]const u8 = null,
 };
 
-/// Client represents each terminal that has connected to a session.
+const ClientKind = enum {
+    terminal,
+    control,
+};
+
+/// Client represents each terminal or control adapter connected to a session.
 ///
 /// Multiple Clients can connect to a single session.
 pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
+    kind: ClientKind = .terminal,
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -896,6 +914,26 @@ pub const Daemon = struct {
         return error.NoLeaderFound;
     }
 
+    fn applyClientResize(
+        gpa: std.mem.Allocator,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        resize: ipc.Resize,
+    ) !void {
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = resize.rows,
+            .ws_col = resize.cols,
+            .ws_xpixel = resize.xpixel,
+            .ws_ypixel = resize.ypixel,
+        };
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+
+        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
+        term.flags.shell_redraws_prompt = .false;
+        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        try term.resize(gpa, .{ .cols = resize.cols, .rows = resize.rows });
+    }
+
     pub fn handleInit(
         self: *Daemon,
         gpa: std.mem.Allocator,
@@ -942,25 +980,7 @@ pub const Daemon = struct {
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
             const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-            // Disable prompt_redraw before resize. The daemon's internal terminal
-            // would otherwise clear prompt lines expecting the shell to redraw them,
-            // but the shell's redraw goes to the PTY (forwarded to clients), not to
-            // this daemon terminal. The clearing corrupts the daemon's snapshot state.
-            const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-            term.flags.shell_redraws_prompt = .false;
-            defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            const opts = ghostty_vt.Terminal.Resize{
-                .cols = resize.cols,
-                .rows = resize.rows,
-            };
-            try term.resize(gpa, opts);
+            try applyClientResize(gpa, pty_fd, term, resize);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
@@ -968,6 +988,26 @@ pub const Daemon = struct {
 
             std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
         }
+    }
+
+    pub fn handleControlInit(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != @sizeOf(ipc.Resize)) return;
+
+        client.kind = .control;
+        try control_daemon.queueReady(gpa, &client.write_buf);
+        if (self.has_pty_output) _ = try control_daemon.queueViewport(gpa, &client.write_buf, term);
+
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        try applyClientResize(gpa, pty_fd, term, resize);
+        client.has_pending_output = true;
+        std.log.debug("control init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
     pub fn handleResize(
@@ -986,22 +1026,7 @@ pub const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = resize.xpixel,
-            .ws_ypixel = resize.ypixel,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        // Disable prompt_redraw before resize (same rationale as handleInit).
-        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-        term.flags.shell_redraws_prompt = .false;
-        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        const opts = ghostty_vt.Terminal.Resize{
-            .cols = resize.cols,
-            .rows = resize.rows,
-        };
-        try term.resize(gpa, opts);
+        try applyClientResize(gpa, pty_fd, term, resize);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1098,14 +1123,15 @@ pub const Daemon = struct {
             @enumFromInt(payload[0])
         else
             .plain;
-        if (util.serializeTerminal(gpa, term, format)) |output| {
+        if (client.kind == .control) {
+            try control_daemon.queueHistory(gpa, &client.write_buf, term, format);
+        } else if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
             try ipc.appendMessage(gpa, &client.write_buf, .History, output);
-            client.has_pending_output = true;
         } else {
             try ipc.appendMessage(gpa, &client.write_buf, .History, "");
-            client.has_pending_output = true;
         }
+        client.has_pending_output = true;
     }
 
     pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
@@ -1303,6 +1329,68 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 };
+
+test "control init classifies client, acknowledges handshake, and resizes" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = try std.ArrayList(u8).initCapacity(alloc, 64),
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    const resize = ipc.Resize{ .rows = 40, .cols = 100 };
+
+    try daemon.handleControlInit(alloc, &client, -1, &term, std.mem.asBytes(&resize));
+
+    try std.testing.expectEqual(ClientKind.control, client.kind);
+    try std.testing.expect(client.has_pending_output);
+    const ready = std.mem.bytesToValue(ipc.Header, client.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.ControlReady, ready.tag);
+    try std.testing.expectEqual(@as(u32, 0), ready.len);
+    try std.testing.expectEqual(@as(usize, 100), term.screens.active.pages.cols);
+    try std.testing.expectEqual(@as(usize, 40), term.screens.active.pages.rows);
+}
+
+test "control init rejects malformed resize before classifying client" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = try std.ArrayList(u8).initCapacity(alloc, 64),
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+
+    try daemon.handleControlInit(alloc, &client, -1, undefined, "short");
+    try std.testing.expectEqual(ClientKind.terminal, client.kind);
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+}
 
 test "send queues PTY input without changing leader" {
     const alloc = std.testing.allocator;

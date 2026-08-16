@@ -23,6 +23,14 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
+    // KKL control protocol. These internal tags deliberately do not reuse the
+    // external zmx-control/v1 values (14-17 are already frozen above).
+    ControlInit = 19,
+    ControlReady = 20,
+    ControlViewport = 21,
+    ControlLive = 22,
+    ControlHistoryChunk = 23,
+    ControlHistoryEnd = 24,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -314,13 +322,15 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
-        .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },
+        .{ Tag.Input, 0 },              .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },             .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },               .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },                .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },             .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
+        .{ Tag.LabelSet, 15 },          .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
+        .{ Tag.Send, 18 },              .{ Tag.ControlInit, 19 },  .{ Tag.ControlReady, 20 },
+        .{ Tag.ControlViewport, 21 },   .{ Tag.ControlLive, 22 },  .{ Tag.ControlHistoryChunk, 23 },
+        .{ Tag.ControlHistoryEnd, 24 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
