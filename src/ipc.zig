@@ -133,6 +133,29 @@ pub fn appendMessage(
     }
 }
 
+/// Discard fully written messages while retaining the complete bytes and send
+/// offset of the one message whose write may have started.
+pub fn compactWrittenMessages(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    write_head: *usize,
+) !void {
+    if (write_head.* > list.items.len) return error.InvalidWriteHead;
+
+    var discard_len: usize = 0;
+    while (discard_len < write_head.*) {
+        const remaining = list.items[discard_len..];
+        const message_len = expectedLength(remaining) orelse return error.InvalidMessageBuffer;
+        if (message_len > remaining.len) return error.InvalidMessageBuffer;
+        if (discard_len + message_len > write_head.*) break;
+        discard_len += message_len;
+    }
+
+    if (discard_len == 0) return;
+    try list.replaceRange(gpa, 0, discard_len, &.{});
+    write_head.* -= discard_len;
+}
+
 fn writeAll(fd: i32, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
@@ -332,6 +355,29 @@ test "Tag wire values are frozen" {
         .{ Tag.ControlViewport, 21 },   .{ Tag.ControlLive, 22 },  .{ Tag.ControlHistoryChunk, 23 },
         .{ Tag.ControlHistoryEnd, 24 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "written message compaction retains only a partially written frame" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendMessage(alloc, &out, .ControlReady, "");
+    try appendMessage(alloc, &out, .ControlLive, "started");
+    try appendMessage(alloc, &out, .ControlHistoryEnd, "");
+
+    var write_head: usize = @sizeOf(Header) + @sizeOf(Header) + 2;
+    try compactWrittenMessages(alloc, &out, &write_head);
+
+    try std.testing.expectEqual(@sizeOf(Header) + 2, write_head);
+    const first = std.mem.bytesToValue(Header, out.items[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.ControlLive, first.tag);
+    try std.testing.expectEqualStrings("started", out.items[@sizeOf(Header)..][0..first.len]);
+
+    write_head = out.items.len;
+    try compactWrittenMessages(alloc, &out, &write_head);
+    try std.testing.expectEqual(@as(usize, 0), write_head);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 pub fn roundTripForTag(
