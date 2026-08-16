@@ -61,7 +61,7 @@ load test_helper
 }
 
 @test "subcommands handle --help and -h without side effects" {
-  for cmd in attach send print write kill wait tail history list completions; do
+  for cmd in attach send print write kill wait tail history control list completions; do
     run "$ZMX" "$cmd" --help
     [ "$status" -eq 0 ]
     [[ "$output" == *"Usage:"* ]]
@@ -305,5 +305,23 @@ load test_helper
   run "$ZMX" history test-long-cmd
   [[ "$output" != *"<1234567890"* ]]
   [[ "$output" == *"12345678901234567890"* ]]
+}
+
+@test "run: preserves a 4000-byte argument through interactive readline" {
+  local payload result i
+  payload=$(printf 'x%.0s' $(seq 1 4000))
+  result="$BATS_TEST_TMPDIR/long-argument.txt"
+
+  run "$ZMX" run test-long-argument -d \
+    bash -c 'printf %s "$1" > "$2"' _ "$payload" "$result"
+  [ "$status" -eq 0 ]
+
+  for i in $(seq 1 100); do
+    [ -f "$result" ] && break
+    sleep 0.02
+  done
+  [ -f "$result" ]
+  [ "$(wc -c < "$result" | tr -d ' ')" -eq 4000 ]
+  [ "$(cat "$result")" = "$payload" ]
 }
 

@@ -12,6 +12,7 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const control_daemon = @import("control/daemon.zig");
+const pty_run_pacer = @import("pty_run_pacer.zig");
 const builtin = @import("builtin");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
@@ -216,8 +217,8 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     }
 }
 
-/// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
-/// clients.  It uses poll() as its non-blocking mechanism.
+/// daemonLoop is what the daemon runs to send and receive ipc commands from its corresponding
+/// clients. It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_fd: lib_posix.socket_t, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
 
@@ -251,10 +252,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             .revents = 0,
         });
 
+        const loop_now = std.Io.Timestamp.now(io, .awake);
+        const pty_write_allowance = daemon.pty_run_pacer.allowance(
+            loop_now,
+            daemon.pty_write_buf.items.len,
+        );
         var pty_events: i16 = lib_posix.POLL.IN;
-        if (daemon.pty_write_buf.items.len > 0) {
-            pty_events |= lib_posix.POLL.OUT;
-        }
+        if (pty_write_allowance > 0) pty_events |= lib_posix.POLL.OUT;
         try poll_fds.append(gpa, .{
             .fd = pty_fd,
             .events = pty_events,
@@ -275,7 +279,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const poll_timeout = daemon.pty_run_pacer.pollTimeout(
+            loop_now,
+            daemon.pty_write_buf.items.len,
+        ) orelse -1;
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -420,15 +428,25 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
         if (poll_fds.items[1].revents & lib_posix.POLL.OUT != 0) {
             while (daemon.pty_write_buf.items.len > 0) {
-                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
+                const write_now = std.Io.Timestamp.now(io, .awake);
+                const allowance = daemon.pty_run_pacer.allowance(
+                    write_now,
+                    daemon.pty_write_buf.items.len,
+                );
+                if (allowance == 0) break;
+
+                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items[0..allowance]) catch |err| {
                     if (err != error.WouldBlock) {
                         std.log.warn("pty write failed: {s}", .{@errorName(err)});
                         daemon.pty_write_buf.clearRetainingCapacity();
+                        daemon.pty_run_pacer.reset();
                     }
                     break;
                 };
                 if (n == 0) break;
+                daemon.pty_run_pacer.recordWrite(write_now, n);
                 daemon.pty_write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
+                if (daemon.pty_run_pacer.remaining > 0) break;
             }
         }
 
@@ -557,6 +575,11 @@ const ClientKind = enum {
     control,
 };
 
+pub const EnsureSessionResult = struct {
+    is_daemon: bool,
+    created: bool,
+};
+
 /// Client represents each terminal or control adapter connected to a session.
 ///
 /// Multiple Clients can connect to a single session.
@@ -591,6 +614,7 @@ pub const Daemon = struct {
     socket_path: []const u8,
     // === opt ===
     pty_write_buf: std.ArrayList(u8) = .empty,
+    pty_run_pacer: pty_run_pacer.Pacer = .{},
     clients: std.ArrayList(*Client) = .empty,
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
     // This control which client is the leader.  The leader controls terminal state and
@@ -621,6 +645,10 @@ pub const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    /// Control-created commands wait until the first control handshake so an
+    /// immediate exit cannot outrun its adapter connection.
+    start_child_on_control: bool = false,
+    child_start_fd: i32 = -1,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -634,6 +662,7 @@ pub const Daemon = struct {
     }
 
     pub fn deinit(self: *Daemon, gpa: std.mem.Allocator) void {
+        self.closeChildStart();
         self.clients.deinit(gpa);
         var it = self.labels.iterator();
         while (it.next()) |entry| {
@@ -643,6 +672,18 @@ pub const Daemon = struct {
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         gpa.free(self.socket_path);
+    }
+
+    fn closeChildStart(self: *Daemon) void {
+        if (self.child_start_fd < 0) return;
+        lib_posix.close(self.child_start_fd);
+        self.child_start_fd = -1;
+    }
+
+    fn releaseChildStart(self: *Daemon) void {
+        if (self.child_start_fd < 0) return;
+        _ = lib_posix.write(self.child_start_fd, "x") catch {};
+        self.closeChildStart();
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -690,6 +731,14 @@ pub const Daemon = struct {
     /// the daemonLoop is created inside this fn and when it returns that means
     /// the daemon stopped and needs to exit.
     pub fn ensureSession(self: *Daemon, io: std.Io) !bool {
+        return (try self.ensureSessionResult(io, true)).is_daemon;
+    }
+
+    pub fn ensureSessionResult(
+        self: *Daemon,
+        io: std.Io,
+        announce_creation: bool,
+    ) !EnsureSessionResult {
         const sesh_name = self.session_name;
         std.log.info("ensure session session={s}", .{sesh_name});
         var dir = try std.Io.Dir.openDirAbsolute(io, self.cfg.socket_dir, .{});
@@ -727,13 +776,22 @@ pub const Daemon = struct {
         }
 
         if (!should_create) {
-            return false;
+            return .{ .is_daemon = false, .created = false };
         }
 
-        return self.run(io, dir, sesh_name);
+        return .{
+            .is_daemon = try self.run(io, dir, sesh_name, announce_creation),
+            .created = true,
+        };
     }
 
-    fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
+    fn run(
+        self: *Daemon,
+        io: std.Io,
+        dir: std.Io.Dir,
+        sesh_name: []const u8,
+        announce_creation: bool,
+    ) !bool {
         std.log.info("creating session={s}", .{sesh_name});
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
         const log_fd = log.log_system.file.?.handle;
@@ -761,14 +819,16 @@ pub const Daemon = struct {
             sesh_name,
             cmd,
             &keep_fds_open,
+            self.start_child_on_control,
         ) catch |err| {
             switch (err) {
                 error.IsClientProc => {
-                    // send a msg to the client that the session was created.
-                    var w_buf: [2048]u8 = undefined;
-                    var w = std.Io.File.stdout().writer(io, &w_buf);
-                    try w.interface.print("session \"{s}\" created\n", .{sesh_name});
-                    try w.interface.flush();
+                    if (announce_creation) {
+                        var w_buf: [2048]u8 = undefined;
+                        var w = std.Io.File.stdout().writer(io, &w_buf);
+                        try w.interface.print("session \"{s}\" created\n", .{sesh_name});
+                        try w.interface.flush();
+                    }
                     lib_posix.close(server_sock_fd);
                     return false;
                 },
@@ -787,6 +847,7 @@ pub const Daemon = struct {
         // =======
 
         self.pid = pty_info.pid;
+        self.child_start_fd = pty_info.child_start_fd;
 
         var threaded: std.Io.Threaded = .init_single_threaded;
         defer threaded.deinit();
@@ -1028,6 +1089,7 @@ pub const Daemon = struct {
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         try applyClientResize(gpa, pty_fd, term, resize);
         client.has_pending_output = true;
+        self.releaseChildStart();
         std.log.debug("control init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1186,6 +1248,10 @@ pub const Daemon = struct {
             self.queuePtyInput(gpa, cmd);
         }
         self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
+        // PTY masters may acknowledge a large bulk write before an interactive
+        // line editor has drained it, dropping the tail and final carriage
+        // return. Bound run injection while preserving the visible command.
+        self.pty_run_pacer.begin(self.pty_write_buf.items.len);
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;

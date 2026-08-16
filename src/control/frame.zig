@@ -1,5 +1,4 @@
 const std = @import("std");
-const ipc = @import("../ipc.zig");
 
 pub const header_len = 5;
 pub const max_payload_len = 16 * 1024 * 1024;
@@ -89,56 +88,6 @@ pub fn append(
     out.appendSliceAssumeCapacity(payload);
 }
 
-/// Translate one accepted external input frame into current internal IPC.
-/// Unknown and output-only external tags are ignored for forward compatibility.
-pub fn appendInputAsIpc(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    frame: Frame,
-) !bool {
-    switch (frame.tag) {
-        .input => try ipc.appendMessage(alloc, out, .Input, frame.payload),
-        .resize => {
-            if (frame.payload.len != 4) return error.InvalidControlResize;
-            const resize = ipc.Resize{
-                .rows = std.mem.readInt(u16, frame.payload[0..2], .little),
-                .cols = std.mem.readInt(u16, frame.payload[2..4], .little),
-                .xpixel = 0,
-                .ypixel = 0,
-            };
-            if (resize.rows == 0 or resize.cols == 0) return error.ControlSizeOutOfRange;
-            try ipc.appendMessage(alloc, out, .Resize, std.mem.asBytes(&resize));
-        },
-        .close => try ipc.appendMessage(alloc, out, .Detach, ""),
-        .history => {
-            if (frame.payload.len > 1) return error.InvalidControlHistory;
-            if (frame.payload.len == 1 and frame.payload[0] > 2) return error.InvalidControlHistory;
-            try ipc.appendMessage(alloc, out, .History, frame.payload);
-        },
-        else => return false,
-    }
-    return true;
-}
-
-/// Translate semantic daemon output into the stable external namespace.
-pub fn appendOutputFromIpc(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    message: ipc.SocketMsg,
-) !bool {
-    const tag: Tag = switch (message.header.tag) {
-        .Output => .output,
-        .History => .history,
-        .ControlViewport => .viewport_snapshot,
-        .ControlLive => .live_output,
-        .ControlHistoryChunk => .history_chunk,
-        .ControlHistoryEnd => .history_end,
-        else => return false,
-    };
-    try append(alloc, out, tag, message.payload);
-    return true;
-}
-
 test "external frame codec uses the exact five-byte little-endian header" {
     const alloc = std.testing.allocator;
     var encoded = std.ArrayList(u8).empty;
@@ -155,51 +104,4 @@ test "external frame codec uses the exact five-byte little-endian header" {
     const decoded = (try decoder.next()).?;
     try std.testing.expectEqual(Tag.live_output, decoded.tag);
     try std.testing.expectEqualStrings("abc", decoded.payload);
-}
-
-test "external resize expands to current internal resize without reusing tags" {
-    const alloc = std.testing.allocator;
-    var internal = std.ArrayList(u8).empty;
-    defer internal.deinit(alloc);
-
-    const payload = [_]u8{ 40, 0, 120, 0 };
-    try std.testing.expect(try appendInputAsIpc(alloc, &internal, .{ .tag = .resize, .payload = &payload }));
-
-    const header = std.mem.bytesToValue(ipc.Header, internal.items[0..@sizeOf(ipc.Header)]);
-    try std.testing.expectEqual(ipc.Tag.Resize, header.tag);
-    try std.testing.expectEqual(@as(u32, @sizeOf(ipc.Resize)), header.len);
-    const resize = std.mem.bytesToValue(ipc.Resize, internal.items[@sizeOf(ipc.Header)..]);
-    try std.testing.expectEqual(@as(u16, 40), resize.rows);
-    try std.testing.expectEqual(@as(u16, 120), resize.cols);
-    try std.testing.expectEqual(@as(u16, 0), resize.xpixel);
-    try std.testing.expectEqual(@as(u16, 0), resize.ypixel);
-}
-
-test "external history rejects malformed formats before internal IPC" {
-    const alloc = std.testing.allocator;
-    var internal = std.ArrayList(u8).empty;
-    defer internal.deinit(alloc);
-
-    try std.testing.expectError(
-        error.InvalidControlHistory,
-        appendInputAsIpc(alloc, &internal, .{ .tag = .history, .payload = &.{3} }),
-    );
-    try std.testing.expectError(
-        error.InvalidControlHistory,
-        appendInputAsIpc(alloc, &internal, .{ .tag = .history, .payload = &.{ 0, 1 } }),
-    );
-    try std.testing.expectEqual(@as(usize, 0), internal.items.len);
-}
-
-test "output mapping keeps internal and external semantic tags separate" {
-    const alloc = std.testing.allocator;
-    var external = std.ArrayList(u8).empty;
-    defer external.deinit(alloc);
-
-    const message = ipc.SocketMsg{
-        .header = .{ .tag = .ControlViewport, .len = 4 },
-        .payload = "view",
-    };
-    try std.testing.expect(try appendOutputFromIpc(alloc, &external, message));
-    try std.testing.expectEqual(@as(u8, 14), external.items[0]);
 }

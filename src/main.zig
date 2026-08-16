@@ -4,6 +4,7 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const completions = @import("completions.zig");
+const control = @import("control.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
@@ -118,6 +119,15 @@ pub fn main(init: std.process.Init) !void {
         const sesh = try socket.getSeshName(gpa, session_name orelse sesh_env);
         defer gpa.free(sesh);
         return history(gpa, io, &cfg, sesh, format);
+    } else if (std.mem.eql(u8, cmd, "control")) {
+        var control_args = std.ArrayList([]const u8).empty;
+        defer control_args.deinit(gpa);
+        while (args.next()) |arg| try control_args.append(gpa, arg);
+
+        const parsed = try control.parseArgs(control_args.items);
+        if (parsed.help) return help(io);
+        if (parsed.probe) return control.printProbe(io);
+        return control.run(gpa, io, &cfg, shell_env, parsed);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -178,7 +188,6 @@ pub fn main(init: std.process.Init) !void {
             error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
         };
-        defer gpa.free(socket_path);
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.setCwd(cwd);
         daemon.is_task_mode = true;
@@ -423,6 +432,7 @@ fn help(io: std.Io) !void {
         \\  [cl]ear <name>                           Clear all session labels
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
+        \\  control [options] <name> [command...]     Binary control adapter lane
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
@@ -436,6 +446,15 @@ fn help(io: std.Io) !void {
         \\  Examples:
         \\    zmx attach dev
         \\    zmx attach dev vim
+        \\
+        \\Control:
+        \\  Streams zmx-control/v1 frames on stdin/stdout for terminal adapters.
+        \\  Use --probe to print protocol metadata without opening a session.
+        \\  Initial size can be set with --rows N and --cols N.
+        \\
+        \\  Examples:
+        \\    zmx control --probe
+        \\    zmx control --rows 40 --cols 120 dev
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines

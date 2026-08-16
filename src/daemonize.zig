@@ -79,6 +79,9 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
 pub const PtyInfo = struct {
     master_fd: c_int = undefined,
     pid: c_int = undefined,
+    /// Write end of the optional child-start gate. The daemon releases the
+    /// command after the first control client completes its handshake.
+    child_start_fd: c_int = -1,
 };
 
 /// spawnPty runs forkpty() and executes the shell or shell command the user
@@ -86,7 +89,12 @@ pub const PtyInfo = struct {
 ///
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
-pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
+pub fn spawnPty(
+    sesh_name: []const u8,
+    cmd: Cmd,
+    size: ipc.Resize,
+    wait_for_control: bool,
+) !PtyInfo {
     var ws: cross.c.struct_winsize = .{
         .ws_row = size.rows,
         .ws_col = size.cols,
@@ -94,13 +102,38 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
         .ws_ypixel = size.ypixel,
     };
 
-    var master_fd: c_int = undefined;
-    const pid = cross.forkpty(&master_fd, null, null, &ws);
-    if (pid < 0) {
-        return error.ForkPtyFailed;
+    const start_pipe: [2]lib_posix.fd_t = if (wait_for_control)
+        try lib_posix.pipe2(.{ .CLOEXEC = true })
+    else
+        .{ -1, -1 };
+    errdefer {
+        if (start_pipe[0] >= 0) lib_posix.close(start_pipe[0]);
+        if (start_pipe[1] >= 0) lib_posix.close(start_pipe[1]);
     }
 
+    var master_fd: c_int = undefined;
+    const pid = cross.forkpty(&master_fd, null, null, &ws);
+    if (pid < 0) return error.ForkPtyFailed;
+
     if (pid == 0) { // child pid code path
+        if (wait_for_control) {
+            lib_posix.close(start_pipe[1]);
+            var start_byte: [1]u8 = undefined;
+            while (true) {
+                const n = lib_posix.read(start_pipe[0], &start_byte) catch |err| {
+                    if (err == error.Interrupted) continue;
+                    std.log.err("child start wait failed: {s}", .{@errorName(err)});
+                    lib_posix.exit(1);
+                };
+                if (n == 0) {
+                    std.log.err("child start wait closed before control handshake", .{});
+                    lib_posix.exit(1);
+                }
+                break;
+            }
+            lib_posix.close(start_pipe[0]);
+        }
+
         // In the forked child, ANY error must exit rather than propagate:
         // a returned error falls through to the parent code path below,
         // running a second daemon on the same socket (or worse, hitting
@@ -111,7 +144,8 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
         };
         unreachable; // exec() either execs or exits, never returns ok
     }
-    // master pid code path
+
+    if (wait_for_control) lib_posix.close(start_pipe[0]);
     std.log.info("pty spawned session={s} pid={d}", .{ sesh_name, pid });
 
     // make pty non-blocking
@@ -121,6 +155,7 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
     return .{
         .master_fd = master_fd,
         .pid = pid,
+        .child_start_fd = start_pipe[1],
     };
 }
 
@@ -167,7 +202,12 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
 ///                 ✝          │ PID≠SID → can't get a tty
 ///                            ▼
 ///                          DAEMON ✓
-pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
+pub fn daemonize(
+    sesh_name: []const u8,
+    cmd: Cmd,
+    keep_fds_open: []i32,
+    wait_for_control: bool,
+) !PtyInfo {
     // creates the daemon
     const pid = try lib_posix.fork();
     assert(pid != -1);
@@ -235,5 +275,5 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
         }
     }
 
-    return spawnPty(sesh_name, cmd, term_size);
+    return spawnPty(sesh_name, cmd, term_size, wait_for_control);
 }
