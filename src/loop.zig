@@ -390,7 +390,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
                         if (client.kind == .control) {
-                            control_daemon.queuePtyOutput(gpa, &client.write_buf, &term, broadcast_data) catch |err| {
+                            control_daemon.queuePtyOutput(
+                                gpa,
+                                &client.write_buf,
+                                &client.write_head,
+                                &term,
+                                broadcast_data,
+                            ) catch |err| {
                                 std.log.warn(
                                     "failed to buffer control output err={s}",
                                     .{@errorName(err)},
@@ -498,8 +504,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             }
 
             if (revents & lib_posix.POLL.OUT != 0) {
-                // Flush pending output buffers
-                const n = lib_posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
+                // Keep already-sent bytes until the complete queue drains. Control
+                // coalescing can then parse every frame from a stable boundary and
+                // preserve the one frame whose write has already started.
+                const pending = client.write_buf.items[client.write_head..];
+                const n = lib_posix.write(client.socket_fd, pending) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     // Error on write, close client
                     const last = daemon.closeClient(gpa, client, i, false);
@@ -507,11 +516,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     continue;
                 };
 
-                if (n > 0) {
-                    client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
-                }
-
-                if (client.write_buf.items.len == 0) {
+                client.write_head += n;
+                if (client.write_head == client.write_buf.items.len) {
+                    client.write_buf.clearRetainingCapacity();
+                    client.write_head = 0;
                     client.has_pending_output = false;
                 }
             }
@@ -548,6 +556,8 @@ pub const Client = struct {
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    /// Bytes already written from the current frame-aligned buffer.
+    write_head: usize = 0,
 
     pub fn deinit(self: *Client) void {
         lib_posix.close(self.socket_fd);
