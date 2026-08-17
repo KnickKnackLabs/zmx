@@ -350,4 +350,3 @@ load test_helper
   [ "$(wc -c < "$result" | tr -d ' ')" -eq 4000 ]
   [ "$(cat "$result")" = "$payload" ]
 }
-
