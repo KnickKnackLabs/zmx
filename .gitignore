@@ -3,18 +3,15 @@
 .zig-cache/
 zig-cache/
 zig-out/
+zig-pkg/
 Session*.*vim
 commit_msg
 *.sw?
 zig_std_src/
 ghostty_src/
 prior_art/
-scratch/
-docs/plans/
 .beads/
-.agents/
-.pi/
-zig-out-*/
+.envrc
 
 # Nix
 result

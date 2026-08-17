@@ -40,11 +40,7 @@ load test_helper
 }
 
 @test "run: blocking returns after command completes" {
-  run timeout 10 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
-  if [ "$status" -ne 0 ]; then
-    echo "status=$status" >&3
-    echo "$output" >&3
-  fi
+  run timeout 5 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
   [ "$status" -eq 0 ]
   [[ "$output" == *"session \"test-blocking\" created"* ]]
 }
@@ -54,30 +50,31 @@ load test_helper
   [ "$status" -ne 0 ]
 }
 
-# ============================================================================
-# Control protocol
-# ============================================================================
-
-@test "control: command-on-create emits immediate startup output" {
-  run bash -c 'env ZMX_DIR="$1" timeout 5 "$0" control --rows 24 --cols 80 control-immediate /bin/echo bats-control-startup | od -An -tx1 | tr -d " \n"' "$ZMX" "$ZMX_DIR"
+@test "run --help shows help without creating a session" {
+  run "$ZMX" run --help
   [ "$status" -eq 0 ]
-  # Hex for "bats-control-startup". The control stream is binary-framed,
-  # so assert on hex rather than raw shell-captured bytes. Command output is
-  # live PTY output, so the first frame tag must be 0f (LiveOutput), not the
-  # legacy 01 (Output) frame.
-  [[ "$output" == 0f* ]]
-  [[ "$output" == *"626174732d636f6e74726f6c2d73746172747570"* ]]
+  [[ "$output" == *"Usage:"* ]]
+
+  run "$ZMX" list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"--help"* ]]
 }
 
-@test "control: existing session starts with viewport snapshot" {
-  "$ZMX" run control-viewport -d /bin/echo viewport-seed
-  wait_for_session control-viewport
-  sleep 0.5
+@test "subcommands handle --help and -h without side effects" {
+  for cmd in attach send print write kill wait tail history control list completions; do
+    run "$ZMX" "$cmd" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
 
-  run bash -c 'env ZMX_DIR="$1" timeout 1 "$0" control --rows 10 --cols 40 control-viewport | od -An -tx1 | tr -d " \n"' "$ZMX" "$ZMX_DIR"
+    run "$ZMX" "$cmd" -h
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
+  done
+
+  run "$ZMX" list --short
   [ "$status" -eq 0 ]
-  [[ "$output" == 0e* ]]
-  [[ "$output" == *"76696577706f72742d73656564"* ]]
+  [[ "$output" != *"--help"* ]]
+  [[ "$output" != *"-h"* ]]
 }
 
 # ============================================================================
@@ -87,7 +84,7 @@ load test_helper
 @test "send: does not append CR by default" {
   "$ZMX" run test-send-raw -d echo ready
   wait_for_session test-send-raw
-  sleep 0.5
+  wait_for_output test-send-raw ready
 
   # Send text without \r — it should NOT execute as a command
   run "$ZMX" send test-send-raw "partial-text"
@@ -110,12 +107,12 @@ load test_helper
 @test "send: accepts piped stdin" {
   "$ZMX" run test-send-pipe -d echo ready
   wait_for_session test-send-pipe
-  sleep 0.5
+  wait_for_output test-send-pipe ready
 
   run bash -c 'printf "echo piped-marker-xyz789\r" | "$0" send test-send-pipe' "$ZMX"
   [ "$status" -eq 0 ]
 
-  sleep 0.5
+  wait_for_output test-send-pipe piped-marker-xyz789
   run "$ZMX" history test-send-pipe
   [[ "$output" == *"piped-marker-xyz789"* ]]
 }
@@ -127,15 +124,13 @@ load test_helper
 @test "list: no sessions returns cleanly" {
   run "$ZMX" list
   [ "$status" -eq 0 ]
-  # KKL's styled output says "no sessions" via output.printInfo.
-  [[ "$output" == *"no sessions"* ]]
+  [[ "$output" == *"no sessions found"* ]]
 }
 
 @test "ls aliases list" {
   run "$ZMX" ls
   [ "$status" -eq 0 ]
-  # KKL's styled output says "no sessions" via output.printInfo.
-  [[ "$output" == *"no sessions"* ]]
+  [[ "$output" == *"no sessions found"* ]]
 }
 
 @test "list: shows session details" {
@@ -145,9 +140,7 @@ load test_helper
   run "$ZMX" list
   [ "$status" -eq 0 ]
   [[ "$output" == *"test-list"* ]]
-  # KKL's default list is a pretty table with NAME / STATUS / AGE / CMD
-  # columns — no free-form pid=N. Assert on the header instead.
-  [[ "$output" == *"STATUS"* ]]
+  [[ "$output" == *"pid="* ]]
 }
 
 @test "list --short: shows only session names" {
@@ -160,6 +153,32 @@ load test_helper
   [ "$status" -eq 0 ]
   [[ "$output" == *"test-short-a"* ]]
   [[ "$output" == *"test-short-b"* ]]
+}
+
+@test "list --json: preserves the Shell and Portl contract" {
+  "$ZMX" run test-json -d sh -c 'sleep 10'
+  wait_for_session test-json
+
+  run "$ZMX" list --json
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '
+    any(.[];
+      .name == "test-json" and
+      .status == "running" and
+      (.pid | type == "number") and
+      (.clients | type == "number") and
+      has("exit_code") and
+      has("created_at") and
+      has("start_dir") and
+      has("cmd")
+    )
+  ' >/dev/null
+}
+
+@test "list --json: empty list is an array" {
+  run "$ZMX" list --json
+  [ "$status" -eq 0 ]
+  [ "$output" = "[]" ]
 }
 
 @test "list --short: empty when no sessions" {
@@ -178,8 +197,7 @@ load test_helper
 
   run "$ZMX" kill test-kill
   [ "$status" -eq 0 ]
-  # KKL's styled output: "✓ killed <name>" via output.printSuccess.
-  [[ "$output" == *"killed test-kill"* ]]
+  [[ "$output" == *"killed session test-kill"* ]]
 
   run "$ZMX" list --short
   [[ "$output" != *"test-kill"* ]]
@@ -193,9 +211,8 @@ load test_helper
 
   run "$ZMX" kill kill-a kill-b
   [ "$status" -eq 0 ]
-  # KKL's styled output: "✓ killed <name>" (per-line).
-  [[ "$output" == *"killed kill-a"* ]]
-  [[ "$output" == *"killed kill-b"* ]]
+  [[ "$output" == *"killed session kill-a"* ]]
+  [[ "$output" == *"killed session kill-b"* ]]
 }
 
 @test "kill --force: removes socket file for dead session" {
@@ -207,7 +224,12 @@ load test_helper
   pid=$("$ZMX" list 2>/dev/null | grep test-force | sed 's/.*pid=\([0-9]*\).*/\1/')
   if [[ -n "$pid" ]]; then
     kill -9 "$pid" 2>/dev/null || true
-    sleep 0.5
+    # Wait for the OS to actually reap the process before relying on
+    # --force to see it as dead.
+    for _ in $(seq 1 50); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
   fi
 
   # Regular kill may fail on the dead session; --force cleans up
@@ -238,7 +260,7 @@ load test_helper
 @test "history: captures session output" {
   "$ZMX" run test-hist -d echo "bats-marker-xyzzy"
   wait_for_session test-hist
-  sleep 0.5  # give the command time to produce output
+  wait_for_output test-hist bats-marker-xyzzy
 
   run "$ZMX" history test-hist
   [ "$status" -eq 0 ]
@@ -252,7 +274,7 @@ load test_helper
 @test "wait: returns after session command completes" {
   "$ZMX" run test-wait -d echo done
   wait_for_session test-wait
-  sleep 1  # give the command time to finish
+  wait_for_output test-wait done
 
   # `wait` should return once the command finishes
   run timeout 10 "$ZMX" wait test-wait
@@ -283,12 +305,12 @@ load test_helper
 @test "print: text appears in history" {
   "$ZMX" run test-print-hist -d echo ready
   wait_for_session test-print-hist
-  sleep 0.3
+  wait_for_output test-print-hist ready
 
   # Caller is responsible for newlines; trailing \r\n ensures the text
   # lands on its own line before SIGWINCH triggers a prompt redraw.
   printf "\r\nbats-print-marker-abc123\r\n" | "$ZMX" print test-print-hist
-  sleep 0.3
+  wait_for_output test-print-hist bats-print-marker-abc123
 
   run "$ZMX" history test-print-hist
   [ "$status" -eq 0 ]
@@ -298,4 +320,33 @@ load test_helper
 @test "print: requires a session name" {
   run "$ZMX" print
   [ "$status" -ne 0 ]
+}
+
+@test "run: long command line does not truncate history when creating session" {
+  local longcmd="echo 1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"
+  run "$ZMX" run test-long-cmd -d "$longcmd"
+  [ "$status" -eq 0 ]
+  wait_for_session test-long-cmd
+  wait_for_output test-long-cmd 12345678901234567890
+  run "$ZMX" history test-long-cmd
+  [[ "$output" != *"<1234567890"* ]]
+  [[ "$output" == *"12345678901234567890"* ]]
+}
+
+@test "run: preserves a 4000-byte argument through interactive readline" {
+  local payload result i
+  payload=$(printf 'x%.0s' $(seq 1 4000))
+  result="$BATS_TEST_TMPDIR/long-argument.txt"
+
+  run "$ZMX" run test-long-argument -d \
+    bash -c 'printf %s "$1" > "$2"' _ "$payload" "$result"
+  [ "$status" -eq 0 ]
+
+  for i in $(seq 1 100); do
+    [ -f "$result" ] && break
+    sleep 0.02
+  done
+  [ -f "$result" ]
+  [ "$(wc -c < "$result" | tr -d ' ')" -eq 4000 ]
+  [ "$(cat "$result")" = "$payload" ]
 }

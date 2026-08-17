@@ -6,42 +6,55 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Check out source
+        uses: actions/checkout@v4
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
-      - name: Check compilation
-        run: zig build check
+      - name: Install test tools on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install bats-core coreutils jq
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install test tools on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bats jq
 
       - name: Check formatting
         run: zig fmt --check src/
 
-      - name: Unit tests
-        run: zig build test
+      - name: Check compilation
+        run: zig build check
 
-      - name: Build
+      - name: Run unit tests
+        run: zig build test --summary all
+
+      - name: Build executable
         run: zig build
 
-      - name: Install BATS and dependencies
-        run: |
-          if command -v brew &>/dev/null; then
-            brew install bats-core coreutils
-          else
-            sudo apt-get update && sudo apt-get install -y bats
-          fi
-
-      - name: BATS tests
-        run: bats test/
+      - name: Run behavioral tests
+        run: bats --jobs 1 test/*.bats

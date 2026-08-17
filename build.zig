@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_zig_zon = @import("build.zig.zon");
 
 const linux_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
@@ -12,54 +13,49 @@ const macos_targets: []const std.Target.Query = &.{
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    // const is_macos = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version string for release") orelse
-        @as([]const u8, @import("build.zig.zon").version);
-
-    var code: u8 = 0;
-    const git_sha = std.mem.trim(u8, b.runAllowFail(
-        &.{ "git", "rev-parse", "--short", "HEAD" },
-        &code,
-        .Inherit,
-    ) catch "unknown", "\n");
+        @as([]const u8, build_zig_zon.version);
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
-    options.addOption([]const u8, "git_sha", git_sha);
-    const ghostty_ver = @import("build.zig.zon").dependencies.ghostty.hash;
+    const ghostty_ver = build_zig_zon.dependencies.ghostty.hash;
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     exe_mod.addOptions("build_options", options);
-
-    {
-        const clap_dep = b.dependency("clap", .{});
-        exe_mod.addImport("clap", clap_dep.module("clap"));
-    }
-
-    {
-        const zigcli_dep = b.dependency("zigcli", .{});
-        exe_mod.addImport("zigcli", zigcli_dep.module("zigcli"));
-    }
 
     const dep = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
+        .@"emit-lib-vt" = true,
+        // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
+        // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
+        // configure time and breaks builds without full Xcode.
+        .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
     });
-    exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    exe_mod.addImport(
+        "ghostty-vt",
+        dep.module("ghostty-vt"),
+    );
 
     // Run
     {
         const run_step = b.step("run", "Run the app");
         const exe = b.addExecutable(.{
             .name = "zmx",
+            // .use_llvm = true,
+            // .use_lld = !is_macos,
             .root_module = exe_mod,
         });
-        exe.linkLibC();
+
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
@@ -74,25 +70,27 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
         const test_dep = b.dependency("ghostty", .{
             .target = target,
             .optimize = optimize,
+            .@"emit-lib-vt" = true,
+            .@"emit-xcframework" = false,
+            .@"emit-macos-app" = false,
         });
-        test_module.addImport("ghostty-vt", test_dep.module("ghostty-vt"));
+        test_module.addImport(
+            "ghostty-vt",
+            test_dep.module("ghostty-vt"),
+        );
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
+            // .use_llvm = true,
+            // .use_lld = !is_macos,
         });
+
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
-    }
-
-    // Integration tests (bats)
-    {
-        const integration_step = b.step("test-integration", "Run bats integration tests");
-        const bats = b.addSystemCommand(&.{ "bats", "test/session.bats" });
-        bats.step.dependOn(b.getInstallStep());
-        integration_step.dependOn(&bats.step);
     }
 
     // Check for LSP integration
@@ -100,9 +98,14 @@ pub fn build(b: *std.Build) void {
         const check = b.step("check", "Check if zmx compiles");
         const exe_check = b.addExecutable(.{
             .name = "zmx",
+            // .use_llvm = true,
+            // .use_lld = !is_macos,
             .root_module = exe_mod,
         });
-        exe_check.linkLibC();
+
+        // Finally we add the "check" step which will be detected
+        // by ZLS and automatically enable Build-On-Save.
+        // If you copy this into your `build.zig`, make sure to rename 'foo'
         check.dependOn(&exe_check.step);
     }
 
@@ -119,45 +122,53 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved,
                 .optimize = .ReleaseSafe,
+                .link_libc = true,
             });
             release_mod.addOptions("build_options", options);
 
-            {
-                const clap_dep = b.dependency("clap", .{});
-                release_mod.addImport("clap", clap_dep.module("clap"));
-            }
-
-            {
-                const zigcli_dep = b.dependency("zigcli", .{});
-                release_mod.addImport("zigcli", zigcli_dep.module("zigcli"));
-            }
-
-            const release_dep = b.dependency("ghostty", .{
+            if (b.lazyDependency("ghostty", .{
                 .target = resolved,
                 .optimize = .ReleaseSafe,
-            });
-            release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
+                .@"emit-lib-vt" = true,
+                .@"emit-xcframework" = false,
+                .@"emit-macos-app" = false,
+            })) |release_dep| {
+                release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
+            }
 
+            // const is_local_macos = resolved.result.os.tag == .macos;
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
+                // .use_llvm = true,
+                // .use_lld = !is_local_macos,
                 .root_module = release_mod,
             });
-            release_exe.linkLibC();
 
             const os_name = @tagName(release_target.os_tag orelse .linux);
             const arch_name = @tagName(release_target.cpu_arch orelse .x86_64);
             const tarball_name = b.fmt("zmx-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
 
-            const tar = b.addSystemCommand(&.{ "tar", "--no-xattrs", "-czf" });
+            const tar = b.addSystemCommand(&.{ "tar", "-czf" });
 
             const tarball = tar.addOutputFileArg(tarball_name);
             tar.addArg("-C");
             tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
             tar.addArg("zmx");
 
-            const shasum = b.addSystemCommand(&.{ "shasum", "-a", "256" });
+            const shasum = b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                \\set -eu
+                \\archive=$1
+                \\name=$2
+                \\digest=$(sha256sum "$archive")
+                \\printf '%s  %s\n' "${digest%% *}" "$name"
+                ,
+                "zmx-release-checksum",
+            });
             shasum.addFileArg(tarball);
-            const shasum_output = shasum.captureStdOut();
+            shasum.addArg(tarball_name);
+            const shasum_output = shasum.captureStdOut(.{});
 
             const install_tar = b.addInstallFile(tarball, b.fmt("dist/{s}", .{tarball_name}));
             const install_sha = b.addInstallFile(
@@ -167,17 +178,5 @@ pub fn build(b: *std.Build) void {
             release_step.dependOn(&install_tar.step);
             release_step.dependOn(&install_sha.step);
         }
-    }
-
-    // Upload artifacts to pgs
-    {
-        const upload_step = b.step("upload", "Upload docs and dist to pgs.sh:/zmx");
-        const gen_doc = b.addSystemCommand(&.{ "sh", "-c", "cat README.md | pdocs -tmpl index.tmpl -toc | ssh pgs.sh /zmx/index.html" });
-        const rsync_docs = b.addSystemCommand(&.{ "rsync", "-v", "./logo.png", "pgs.sh:/zmx/" });
-        const rsync_dist = b.addSystemCommand(&.{ "rsync", "-rv", "zig-out/dist/", "pgs.sh:/zmx/a" });
-
-        upload_step.dependOn(&gen_doc.step);
-        upload_step.dependOn(&rsync_docs.step);
-        upload_step.dependOn(&rsync_dist.step);
     }
 }

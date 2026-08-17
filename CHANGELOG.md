@@ -6,22 +6,73 @@ Use spec: https://common-changelog.org/
 
 ### Added
 
-- Added `zmx control`, an upstream-neutral automation control protocol
-  with stable `zmx-control/v1` probing, explicit binary frames, optional
-  initial rows/cols, command-on-create argv support, and attach-compatible
-  session creation semantics.
+- We now track cwd changes via OSC7
+- Replay window title on attach
+- `ZMX_NO_DETACH_KEY` env var to disable `ctrl+\` keybinding
+
+### Fixed
+
+- Clear screen when switching sessions to prevent term state corruption
+- Stray NUL byte in the OSC 7 sequence replayed on attach
+- The OSC 7 cwd is now decoded before the chdir, so a new session can start in a directory whose name needed percent-encoding
 
 ### Changed
+
+- Upgraded to zig v0.16
+- `zmx list` replaced `start_dir` with `cwd`
+- Storing 2k lines of scrollback buffer (like tmux) for each session
+- ZMX_TASK_COMPLETED task marker now includes a 4ch hex id to ensure no collisions from nested task runs
+  - `ZMX_TASK_COMPLETED:{id}:0`
+
+## v0.7.0 - 2026-07-23
+
+### Added
+
+- Label system for sessions:
+  - `zmx set <name> k=v ...` to attach key=value labels to live sessions
+  - `zmx set <name> key=` to remove a specific label (empty value = delete)
+  - `zmx get <name>` to read labels from a session
+  - `zmx get <name> key` to print a single value
+  - `zmx clear <name>` to remove all labels
+  - `zmx list` now shows labels by default as tab-separated fields
+
+### Fixed
+
+- `zmx run` will now detect heredocs and add the completion marker to a newline
+- Race between `zmx kill X; zmx run X`
+- Improved claim leader detection
+- `zmx send` no longer claims client leadership or triggers a resize probe
+- Improved `ctrl+\` key detection
+- Support for linux kernel < 4.11 by avoiding statx calls
+
+### Changed
+
+- *BREAKING* We now store logs inside of `XDG_STATE_DIR`
+- *BREAKING* `zmx run` when creating session it runs `bash` instead of `$SHELL`
+  - There are just too many edge cases with tracking exit status in other shells which makes `zmx run` much less useful for task management.
+  - This means when using `zmx run` the target shell must have support for `$?` exit code tracking
+- *BREAKING* `zmx tail` now strips ansi escape codes
+
+## v0.6.0 - 2026-05-16
+
+### Added
 
 - `zmx send` send raw bytes to session without ZMX completion marker or auto-newline
 - `zmx print` send raw bytes to client's stdout
 - `zmx ls` is accepted as an alias for `zmx list`
+- Added `--help` flag for all commands (it just returns the main help cmd for now)
 
 ### Fixed
 
 - An idle daemon (no clients, no PTY traffic) used to ignore SIGTERM indefinitely.
 - An idle attached client used to ignore SIGWINCH until the next keystroke or daemon output.
 - Don't kill all sessions when `.Info` ipc event changed
+- Reset terminal emulator to default state on detach
+
+### Changed
+
+- `zmx wait` output will tail the last 20 lines of every task that failed
+- Detaching from a session will now do a full terminal reset
 
 ## v0.5.0 - 2026-04-16
 

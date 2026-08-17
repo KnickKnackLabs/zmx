@@ -1,7 +1,7 @@
 const std = @import("std");
-const posix = std.posix;
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const lib_posix = @import("posix.zig");
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -18,20 +18,28 @@ pub const Tag = enum(u8) {
     Switch = 11,
     Write = 12,
     TaskComplete = 13,
-    ViewportSnapshot = 14,
-    LiveOutput = 15,
-    HistoryChunk = 16,
-    HistoryEnd = 17,
-    ControlInit = 18,
+    LabelGet = 14,
+    LabelSet = 15,
+    LabelClear = 16,
+    LabelData = 17,
+    Send = 18,
+    // KKL control protocol. These internal tags deliberately do not reuse the
+    // external zmx-control/v1 values (14-17 are already frozen above).
+    ControlInit = 19,
+    ControlReady = 20,
+    ControlViewport = 21,
+    ControlLive = 22,
+    ControlHistoryChunk = 23,
+    ControlHistoryEnd = 24,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (19-255) are representable
-    // rather than UB. Switches must handle `_` or `else` (unknown tag).
+    // @enumFromInt, so out-of-range values are representable
+    // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
 
 comptime {
     if (@typeInfo(Tag).@"enum".is_exhaustive) @compileError(
-        "ipc.Tag must stay non-exhaustive — old daemons rely on `_` to ignore unknown tags",
+        "ipc.Tag must stay non-exhaustive -- old daemons rely on `_` to ignore unknown tags",
     );
 }
 
@@ -43,20 +51,35 @@ pub const Header = packed struct {
 pub const Resize = packed struct {
     rows: u16,
     cols: u16,
+    xpixel: u16 = 0,
+    ypixel: u16 = 0,
 };
 
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col };
+        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
     }
-    return .{ .rows = 24, .cols = 80 };
+    inline for (.{ lib_posix.STDOUT_FILENO, lib_posix.STDIN_FILENO, lib_posix.STDERR_FILENO }) |fallback_fd| {
+        if (fallback_fd != fd) {
+            if (cross.c.ioctl(fallback_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+                return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
+            }
+        }
+    }
+    if (lib_posix.open("/dev/tty", .{ .ACCMODE = .RDWR }, 0)) |tty_fd| {
+        defer lib_posix.close(tty_fd);
+        if (cross.c.ioctl(tty_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+            return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
+        }
+    } else |_| {}
+    return .{ .rows = 24, .cols = 120 };
 }
 
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 
-/// Frozen wire shape. Do NOT add fields — new stats go in new `Tag` values
+/// Frozen wire shape. Do NOT add fields! New stats go in new `Tag` values
 /// so old daemons (whose `_` arm ignores unknown tags) stay reachable.
 /// Changing `@sizeOf(Info)` breaks `zmx list` against running daemons.
 pub const Info = extern struct {
@@ -92,26 +115,51 @@ pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
 }
 
 pub fn appendMessage(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     tag: Tag,
     data: []const u8,
 ) !void {
-    std.log.info("sending ipc message tag={s}", .{@tagName(tag)});
     const header = Header{
         .tag = tag,
         .len = @intCast(data.len),
     };
-    try list.appendSlice(alloc, std.mem.asBytes(&header));
+    // Guarantee capacity for header + payload in one check to avoid
+    // intermediate realloc between the two appends on the hot path.
+    try list.ensureTotalCapacity(gpa, list.items.len + @sizeOf(Header) + data.len);
+    list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
     if (data.len > 0) {
-        try list.appendSlice(alloc, data);
+        list.appendSliceAssumeCapacity(data);
     }
+}
+
+/// Discard fully written messages while retaining the complete bytes and send
+/// offset of the one message whose write may have started.
+pub fn compactWrittenMessages(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    write_head: *usize,
+) !void {
+    if (write_head.* > list.items.len) return error.InvalidWriteHead;
+
+    var discard_len: usize = 0;
+    while (discard_len < write_head.*) {
+        const remaining = list.items[discard_len..];
+        const message_len = expectedLength(remaining) orelse return error.InvalidMessageBuffer;
+        if (message_len > remaining.len) return error.InvalidMessageBuffer;
+        if (discard_len + message_len > write_head.*) break;
+        discard_len += message_len;
+    }
+
+    if (discard_len == 0) return;
+    try list.replaceRange(gpa, 0, discard_len, &.{});
+    write_head.* -= discard_len;
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
-        const n = try posix.write(fd, data[index..]);
+        const n = try lib_posix.write(fd, data[index..]);
         if (n == 0) return error.DiskQuota;
         index += n;
     }
@@ -167,7 +215,7 @@ pub const SocketBuffer = struct {
         }
 
         var tmp: [4096]u8 = undefined;
-        const n = try posix.read(fd, &tmp);
+        const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
         }
@@ -214,6 +262,13 @@ const SessionProbeError = error{
 const SessionProbeResult = struct {
     fd: i32,
     info: Info,
+    labels: ?[]const u8,
+    alloc: std.mem.Allocator,
+
+    pub fn deinit(self: *const SessionProbeResult) void {
+        if (self.labels) |lbl| self.alloc.free(lbl);
+        lib_posix.close(self.fd);
+    }
 };
 
 pub fn probeSession(
@@ -222,12 +277,13 @@ pub fn probeSession(
 ) SessionProbeError!SessionProbeResult {
     const timeout_ms = 1000;
     const fd = try connectSession(socket_path);
-    errdefer posix.close(fd);
+    errdefer lib_posix.close(fd);
 
     send(fd, .Info, "") catch return error.Unexpected;
+    send(fd, .LabelGet, "") catch {};
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) {
         return error.Timeout;
     }
@@ -238,19 +294,43 @@ pub fn probeSession(
     const n = sb.read(fd) catch return error.Unexpected;
     if (n == 0) return error.Unexpected;
 
-    while (sb.next()) |msg| {
-        if (msg.header.tag == .Info) {
-            if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
-            return .{
-                .fd = fd,
-                .info = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]),
-            };
+    var info_result: ?Info = null;
+    var labels: ?[]const u8 = null;
+    errdefer if (labels) |lbl| alloc.free(lbl);
+
+    while (true) {
+        if (sb.next()) |msg| {
+            if (msg.header.tag == .Info) {
+                if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
+                info_result = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]);
+            }
+            if (msg.header.tag == .LabelData) {
+                labels = alloc.dupe(u8, msg.payload) catch null;
+            }
+
+            if (info_result != null and labels != null) break;
+            continue;
         }
+
+        // No complete message available, wait for more data
+        const more = lib_posix.poll(&poll_fds, 50) catch break;
+        if (more == 0) break;
+        const n_read = sb.read(fd) catch break;
+        if (n_read == 0) break;
+    }
+
+    if (info_result) |info| {
+        return .{
+            .fd = fd,
+            .info = info,
+            .labels = labels,
+            .alloc = alloc,
+        };
     }
     return error.Unexpected;
 }
 
-//  WIRE PROTOCOL FREEZE — read before "fixing" any test below.
+//  WIRE PROTOCOL FREEZE: read before "fixing" any test below.
 //
 //  Changing these constants does not fix the test; it breaks every
 //  running daemon for every user until they `pkill -f zmx`.
@@ -265,14 +345,70 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },        .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },       .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },         .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },          .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },       .{ Tag.TaskComplete, 13 }, .{ Tag.ViewportSnapshot, 14 },
-        .{ Tag.LiveOutput, 15 },  .{ Tag.HistoryChunk, 16 }, .{ Tag.HistoryEnd, 17 },
-        .{ Tag.ControlInit, 18 },
+        .{ Tag.Input, 0 },              .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },             .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },               .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },                .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },             .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
+        .{ Tag.LabelSet, 15 },          .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
+        .{ Tag.Send, 18 },              .{ Tag.ControlInit, 19 },  .{ Tag.ControlReady, 20 },
+        .{ Tag.ControlViewport, 21 },   .{ Tag.ControlLive, 22 },  .{ Tag.ControlHistoryChunk, 23 },
+        .{ Tag.ControlHistoryEnd, 24 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "written message compaction retains only a partially written frame" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendMessage(alloc, &out, .ControlReady, "");
+    try appendMessage(alloc, &out, .ControlLive, "started");
+    try appendMessage(alloc, &out, .ControlHistoryEnd, "");
+
+    var write_head: usize = @sizeOf(Header) + @sizeOf(Header) + 2;
+    try compactWrittenMessages(alloc, &out, &write_head);
+
+    try std.testing.expectEqual(@sizeOf(Header) + 2, write_head);
+    const first = std.mem.bytesToValue(Header, out.items[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.ControlLive, first.tag);
+    try std.testing.expectEqualStrings("started", out.items[@sizeOf(Header)..][0..first.len]);
+
+    write_head = out.items.len;
+    try compactWrittenMessages(alloc, &out, &write_head);
+    try std.testing.expectEqual(@as(usize, 0), write_head);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+pub fn roundTripForTag(
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    request_tag: Tag,
+    payload: []const u8,
+    expected_tag: Tag,
+) SessionProbeError![]u8 {
+    const timeout_ms = 1000;
+    const fd = try connectSession(socket_path);
+    defer lib_posix.close(fd);
+
+    send(fd, request_tag, payload) catch return error.Unexpected;
+
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    if (poll_result == 0) return error.Timeout;
+
+    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
+    defer sb.deinit();
+
+    const n = sb.read(fd) catch return error.Unexpected;
+    if (n == 0) return error.Unexpected;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == expected_tag) {
+            return alloc.dupe(u8, msg.payload) catch return error.Unexpected;
+        }
+    }
+    return error.Unexpected;
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {
