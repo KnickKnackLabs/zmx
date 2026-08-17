@@ -155,8 +155,19 @@ pub fn build(b: *std.Build) void {
             tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
             tar.addArg("zmx");
 
-            const shasum = b.addSystemCommand(&.{"sha256sum"});
+            const shasum = b.addSystemCommand(&.{
+                "sh",
+                "-c",
+                \\set -eu
+                \\archive=$1
+                \\name=$2
+                \\digest=$(sha256sum "$archive")
+                \\printf '%s  %s\n' "${digest%% *}" "$name"
+                ,
+                "zmx-release-checksum",
+            });
             shasum.addFileArg(tarball);
+            shasum.addArg(tarball_name);
             const shasum_output = shasum.captureStdOut(.{});
 
             const install_tar = b.addInstallFile(tarball, b.fmt("dist/{s}", .{tarball_name}));

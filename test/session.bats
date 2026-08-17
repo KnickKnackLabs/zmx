@@ -155,6 +155,32 @@ load test_helper
   [[ "$output" == *"test-short-b"* ]]
 }
 
+@test "list --json: preserves the Shell and Portl contract" {
+  "$ZMX" run test-json -d sh -c 'sleep 10'
+  wait_for_session test-json
+
+  run "$ZMX" list --json
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | jq -e '
+    any(.[];
+      .name == "test-json" and
+      .status == "running" and
+      (.pid | type == "number") and
+      (.clients | type == "number") and
+      has("exit_code") and
+      has("created_at") and
+      has("start_dir") and
+      has("cmd")
+    )
+  ' >/dev/null
+}
+
+@test "list --json: empty list is an array" {
+  run "$ZMX" list --json
+  [ "$status" -eq 0 ]
+  [ "$output" = "[]" ]
+}
+
 @test "list --short: empty when no sessions" {
   run "$ZMX" list --short
   [ "$status" -eq 0 ]

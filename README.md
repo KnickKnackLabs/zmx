@@ -13,6 +13,15 @@
   Sponsored by <a href="https://pico.sh">pico.sh</a>
 </p>
 
+> [!NOTE]
+> This is the KnickKnackLabs fork of
+> [neurosnap/zmx](https://github.com/neurosnap/zmx).
+> It tracks current upstream behavior while preserving the KKL consumer contracts:
+> reliable long `run` submissions,
+> machine-readable `list --json`,
+> and the generic `zmx-control/v1` terminal-adapter protocol.
+> The remaining documentation below is inherited from upstream unless marked otherwise.
+
 ## features
 
 - Persist terminal shell sessions
@@ -107,7 +116,7 @@ Commands:
   [p]rint <name> <text...>                 Inject text into session display
   [wr]ite <name> <file_path>               Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short|--where k=v]          List active sessions
+  [l]ist|ls [--short|--json|--where k=v]   List active sessions
   [g]et <name>                             Get session labels
   set <name> k=v ...                       Set session labels
   [un]set <name> key ...                   Remove session labels

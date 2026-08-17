@@ -5,6 +5,7 @@ const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const completions = @import("completions.zig");
 const control = @import("control.zig");
+const list_output = @import("list.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
@@ -50,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     const shell_env = init.environ_map.get("SHELL") orelse "/bin/sh";
 
     const cmd = args.next() orelse {
-        return list(gpa, io, &cfg, false);
+        return list(gpa, io, &cfg, false, false);
     };
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
@@ -59,11 +60,14 @@ pub fn main(init: std.process.Init) !void {
         return help(io);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l") or std.mem.eql(u8, cmd, "ls")) {
         var short = false;
+        var json_output = false;
         while (args.next()) |arg| {
             if (detectHelp(arg)) return help(io);
             if (std.mem.eql(u8, arg, "--short")) short = true;
+            if (std.mem.eql(u8, arg, "--json")) json_output = true;
         }
-        return list(gpa, io, &cfg, short);
+        if (short and json_output) return error.InvalidArgument;
+        return list(gpa, io, &cfg, short, json_output);
     } else if (std.mem.eql(u8, cmd, "get") or std.mem.eql(u8, cmd, "g")) {
         const sesh_name = args.next() orelse return error.SessionNameRequired;
         if (detectHelp(sesh_name)) return help(io);
@@ -426,7 +430,7 @@ fn help(io: std.Io) !void {
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
-        \\  [l]ist|ls [--short|--where k=v]          List active sessions
+        \\  [l]ist|ls [--short|--json|--where k=v]   List active sessions
         \\  [g]et <name>                             Get session labels
         \\  set <name> k=v ...                     Set session labels (k= to remove)
         \\  [cl]ear <name>                           Clear all session labels
@@ -925,7 +929,13 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     std.process.exit(agg_exit_code);
 }
 
-fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
+fn list(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    short: bool,
+    json_output: bool,
+) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
@@ -937,6 +947,15 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
         sessions.deinit(alloc);
     }
 
+    std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
+
+    if (json_output) {
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        try list_output.writeJson(&stdout.interface, sessions.items, current_session, now);
+        try stdout.interface.flush();
+        return;
+    }
+
     if (sessions.items.len == 0) {
         if (short) return;
         var errbuf: [4096]u8 = undefined;
@@ -946,15 +965,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
         return;
     }
 
-    std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
-
     for (sessions.items) |session| {
-        if (session.is_error) {
-            try util.writeSessionLine(&stdout.interface, session, short, current_session);
-            try stdout.interface.flush();
-            continue;
-        }
-
         try util.writeSessionLine(&stdout.interface, session, short, current_session);
         try stdout.interface.flush();
     }
