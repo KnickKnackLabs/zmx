@@ -96,19 +96,22 @@ port the explicit KKL delta,
 run consumer validation,
 and merge through review.
 
-### Release workflow: retired pending replacement
+### Release workflow: replaced
 
-The old release workflow targeted Zig 0.15 and historical artifact assumptions.
-It is intentionally not restored.
-A local Zig 0.16 cross-platform build exposed severe contention when all four
-ReleaseSafe targets compiled without a job bound.
-Each Linux target completed independently in under two minutes,
-and `zig build release -j1` produced all four archives in under two minutes
-with a warm dependency cache.
-The build now writes portable checksum entries that name the distributed archive
-rather than Zig's temporary cache path.
+`.github/workflows/release.yml` replaces the old Zig 0.15 workflow.
+It uses Zig 0.16 and `-j1` to prevent four concurrent ReleaseSafe targets
+from exhausting the runner.
+The build job ad-hoc signs the macOS binaries,
+verifies the exact four archives and their portable checksums,
+and retains all eight files as a workflow artifact.
 
-A future release workflow should build a bounded target matrix or use `-j1`,
-verify each archive and checksum,
-and run real Shell and terminal-adapter consumers against the exact candidate.
-No KKL release should be published until that replacement path is reviewed and proven.
+Manual dispatches are build-only dry runs.
+They prove the packaging path without creating a tag or GitHub release.
+Only a pushed `vMAJOR.MINOR.PATCH-kkl.N` tag enters the publication job.
+That job requires an annotated tag with a GitHub-verified signature,
+rechecks the downloaded artifact inventory and checksums,
+and creates a new release without deleting or overwriting an existing one.
+
+The KKL tag keeps fork iteration in its name,
+while release archives use the upstream-compatible `MAJOR.MINOR.PATCH` version.
+Real Shell and terminal-adapter validation remains a release gate outside the packaging workflow.

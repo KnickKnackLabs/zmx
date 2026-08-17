@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: KKL release version without the leading v (for example, 0.7.0-kkl.1)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*-kkl.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build release artifacts
+    runs-on: macos-latest
+    timeout-minutes: 30
+    outputs:
+      full_version: ${{ steps.version.outputs.full }}
+      build_version: ${{ steps.version.outputs.build }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install release tools
+        run: |
+          brew install coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Resolve release version
+        id: version
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            full="${GITHUB_REF_NAME#v}"
+          else
+            full="$DISPATCH_VERSION"
+          fi
+
+          if [[ ! "$full" =~ ^[0-9]+\.[0-9]+\.[0-9]+-kkl\.[0-9]+$ ]]; then
+            echo "Expected KKL release version MAJOR.MINOR.PATCH-kkl.N; got: $full" >&2
+            exit 1
+          fi
+
+          build="${full%%-kkl.*}"
+          package=$(awk -F '"' '/^[[:space:]]*\.version = "/ { print $2; exit }' build.zig.zon)
+          if [[ -z "$package" || "$build" != "$package" ]]; then
+            echo "Tag base version $build does not match package version $package" >&2
+            exit 1
+          fi
+
+          printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
+          printf 'build=%s\n' "$build" >> "$GITHUB_OUTPUT"
+
+      - name: Build bounded release archives
+        run: zig build release -j1 -Dversion=${{ steps.version.outputs.build }}
+
+      - name: Ad-hoc sign macOS binaries
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          for arch in aarch64 x86_64; do
+            archive="zig-out/dist/zmx-${BUILD_VERSION}-macos-${arch}.tar.gz"
+            work=$(mktemp -d)
+            trap 'rm -rf "$work"' EXIT
+
+            tar -xzf "$archive" -C "$work"
+            codesign --force --sign - "$work/zmx"
+            codesign --verify --verbose=2 "$work/zmx"
+            tar -czf "$archive" -C "$work" zmx
+
+            (
+              cd zig-out/dist
+              sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256"
+            )
+            rm -rf "$work"
+            trap - EXIT
+          done
+
+      - name: Verify release inventory and checksums
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          cd zig-out/dist
+
+          expected=(
+            "zmx-${BUILD_VERSION}-linux-aarch64.tar.gz"
+            "zmx-${BUILD_VERSION}-linux-x86_64.tar.gz"
+            "zmx-${BUILD_VERSION}-macos-aarch64.tar.gz"
+            "zmx-${BUILD_VERSION}-macos-x86_64.tar.gz"
+          )
+
+          for archive in "${expected[@]}"; do
+            test -s "$archive"
+            test -s "${archive}.sha256"
+            test "$(tar -tzf "$archive")" = "zmx"
+            sha256sum --check "${archive}.sha256"
+          done
+
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 8
+
+      - name: Retain verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zmx-${{ steps.version.outputs.full }}
+          path: zig-out/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish signed-tag release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: zmx-${{ needs.build.outputs.full_version }}
+          path: dist
+
+      - name: Verify annotated signed tag and artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_VERSION: ${{ needs.build.outputs.build_version }}
+        run: |
+          set -euo pipefail
+
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type')" = "tag"
+          tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.sha')
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" --jq '.verification.verified')" = "true"
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+          cd dist
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 8
+
+          for platform in linux-aarch64 linux-x86_64 macos-aarch64 macos-x86_64; do
+            test -s "zmx-${BUILD_VERSION}-${platform}.tar.gz"
+            test -s "zmx-${BUILD_VERSION}-${platform}.tar.gz.sha256"
+          done
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_VERSION: ${{ needs.build.outputs.full_version }}
+          BUILD_VERSION: ${{ needs.build.outputs.build_version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          git for-each-ref --format='%(contents)' "refs/tags/${GITHUB_REF_NAME}" > /tmp/release-notes.md
+          cat >> /tmp/release-notes.md <<EOF
+
+          Install assets use upstream-compatible version ${BUILD_VERSION} under KKL tag ${GITHUB_REF_NAME}.
+          EOF
+
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "zmx ${FULL_VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            dist/*
