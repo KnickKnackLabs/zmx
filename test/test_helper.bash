@@ -3,11 +3,17 @@
 REPO_DIR="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
 setup() {
-  # Build once per test suite (skips if already built)
-  if [[ ! -x "$REPO_DIR/zig-out/bin/zmx" ]]; then
-    cd "$REPO_DIR" && zig build
+  # Default to the local build; ZMX can select an exact released binary.
+  if [[ -z "${ZMX:-}" ]]; then
+    if [[ ! -x "$REPO_DIR/zig-out/bin/zmx" ]]; then
+      cd "$REPO_DIR" && zig build
+    fi
+    ZMX="$REPO_DIR/zig-out/bin/zmx"
   fi
-  ZMX="$REPO_DIR/zig-out/bin/zmx"
+  if [[ "$ZMX" != /* || ! -x "$ZMX" ]]; then
+    echo "ZMX must name an executable by absolute path: $ZMX" >&2
+    return 1
+  fi
 
   # Isolate socket dir so tests don't interfere with real sessions or each other
   export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
