@@ -14,14 +14,17 @@ home = root / "env-home"
 home.mkdir(mode=0o700)
 socket_dir = os.environ["ZMX_DIR"]
 value = "env-private-canary: it's $(touch injected); `touch injected` \\ = \t café"
+# Larger than one 4096-byte socket read, so print-env must drain multiple reads.
+big = "x" * 5000
 env = {
     "HOME": str(home),
     "PATH": os.defpath,
     "TERM": "xterm-256color",
     "ZMX_DIR": socket_dir,
-    "ZMX_TRACK_ENV": "ZMXTEST_VALUE,ZMXTEST_EMPTY,ZMXTEST_UNSET",
+    "ZMX_TRACK_ENV": "ZMXTEST_VALUE,ZMXTEST_EMPTY,ZMXTEST_BIG,ZMXTEST_UNSET",
     "ZMXTEST_VALUE": value,
     "ZMXTEST_EMPTY": "",
+    "ZMXTEST_BIG": big,
 }
 
 
@@ -45,7 +48,7 @@ attach = subprocess.Popen(
 os.close(slave)
 try:
     # The reply proves the public attach path forwarded EnvSet and became leader.
-    expected = f"ZMXTEST_VALUE={value}\nZMXTEST_EMPTY=\n-ZMXTEST_UNSET\n".encode()
+    expected = f"ZMXTEST_VALUE={value}\nZMXTEST_EMPTY=\nZMXTEST_BIG={big}\n-ZMXTEST_UNSET\n".encode()
     deadline = time.monotonic() + 5
     while True:
         result = cli("print-env", "env-roundtrip")
@@ -57,6 +60,7 @@ try:
 
     assert print_env("env-roundtrip", "ZMXTEST_VALUE") == (value + "\n").encode()
     assert print_env("env-roundtrip", "ZMXTEST_EMPTY") == b"\n"
+    assert print_env("env-roundtrip", "ZMXTEST_BIG") == (big + "\n").encode()
     assert cli("print-env", "env-roundtrip", "ZMXTEST_UNSET").returncode == 1
 
     shell_commands = print_env("-s", "env-roundtrip")

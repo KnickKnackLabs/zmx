@@ -411,21 +411,24 @@ pub fn roundTripForTag(
     send(fd, request_tag, payload) catch return error.Unexpected;
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
-    if (poll_result == 0) return error.Timeout;
 
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
     defer sb.deinit();
 
-    const n = sb.read(fd) catch return error.Unexpected;
-    if (n == 0) return error.Unexpected;
-
-    while (sb.next()) |msg| {
-        if (msg.header.tag == expected_tag) {
-            return alloc.dupe(u8, msg.payload) catch return error.Unexpected;
+    // The reply can span several reads when its payload is large, so drain
+    // until the complete expected message arrives instead of parsing a single
+    // read. Each wait is bounded by timeout_ms.
+    while (true) {
+        while (sb.next()) |msg| {
+            if (msg.header.tag == expected_tag) {
+                return alloc.dupe(u8, msg.payload) catch return error.Unexpected;
+            }
         }
+        const ready = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+        if (ready == 0) return error.Timeout;
+        const n = sb.read(fd) catch return error.Unexpected;
+        if (n == 0) return error.Unexpected;
     }
-    return error.Unexpected;
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {
