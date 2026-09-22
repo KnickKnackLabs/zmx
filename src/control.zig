@@ -117,10 +117,9 @@ pub fn run(
 
     // ensureSession may fork. Use the libc allocator for all client-side state
     // created after that boundary, matching the terminal client loop.
-    const layout = try client.detectLayout(std.heap.c_allocator, socket_path);
     const client_fd = try socket.sessionConnect(socket_path);
     std.log.info("control attached session={s} protocol={s}", .{ sesh, args.protocol_name });
-    try client.run(client_fd, layout, .{
+    try client.run(client_fd, .{
         .rows = args.rows,
         .cols = args.cols,
         .drain_after_stdin_eof = ensured.created and command != null,

@@ -11,8 +11,16 @@ or replay obsolete fork history.
 
 The generic binary terminal-adapter protocol is owned under `src/control/`.
 Its public five-byte frame format is separate from zmx's internal IPC tags.
-The client supports current KKL daemons and the previous released KKL daemon
-without sending a legacy tag into an unclassified current daemon.
+Clients and daemons must run the same version. Mixed-version operation is not
+supported; there is no legacy-daemon probe or resize compatibility path.
+Existing sessions must be closed deliberately before adopting a new binary.
+A source sync does not authorize restarting sessions.
+
+The single internal socket retains canonical upstream IPC numbers (currently
+0–21). KKL's six control tags occupy 128–133. That block is a fork convention,
+not an upstream reservation: compare tag assignments on every sync and move
+our block if upstream assigns any of those numbers. Renumbering internal tags
+does not change the public `zmx-control/v1` framing or tags.
 
 Validation lives in Zig protocol and daemon tests,
 `test/control.bats`,
@@ -52,6 +60,17 @@ history framing,
 and command-on-create output ordering.
 These behaviors are integrated with current upstream terminal and daemon APIs
 rather than copied as old monolithic control code.
+
+### Tracked environments: validated at each boundary
+
+`src/tracked_env.zig` owns environment capture, record validation and POSIX shell
+quoting. It preserves upstream's newline-delimited format and IPC tags, while
+rejecting invalid names and values that cannot be represented. Invalid incoming
+records disconnect the sender; no environment commands are printed from a
+malformed reply. Raw environment values must never be logged.
+
+Unit tests and `test/env.bats` cover capture rejection, daemon rejection,
+public attach/print-env round trips, literal shell quoting and value-free logs.
 
 ## Replaced fork code
 
