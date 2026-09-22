@@ -23,14 +23,20 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
-    // KKL control protocol. These internal tags deliberately do not reuse the
-    // external zmx-control/v1 values (14-17 are already frozen above).
-    ControlInit = 19,
-    ControlReady = 20,
-    ControlViewport = 21,
-    ControlLive = 22,
-    ControlHistoryChunk = 23,
-    ControlHistoryEnd = 24,
+    EnvGet = 19,
+    EnvSet = 20,
+    EnvData = 21,
+
+    // KKL-only block, not an upstream reservation. Check every upstream sync
+    // for collisions; move this block if upstream needs these values.
+    // Clients and daemons must use the same version. Public zmx-control/v1
+    // tags live separately in control/frame.zig and do not change here.
+    ControlInit = 128,
+    ControlReady = 129,
+    ControlViewport = 130,
+    ControlLive = 131,
+    ControlHistoryChunk = 132,
+    ControlHistoryEnd = 133,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -39,7 +45,7 @@ pub const Tag = enum(u8) {
 
 comptime {
     if (@typeInfo(Tag).@"enum".is_exhaustive) @compileError(
-        "ipc.Tag must stay non-exhaustive -- old daemons rely on `_` to ignore unknown tags",
+        "ipc.Tag must stay non-exhaustive so unknown wire values are representable",
     );
 }
 
@@ -53,6 +59,10 @@ pub const Resize = packed struct {
     cols: u16,
     xpixel: u16 = 0,
     ypixel: u16 = 0,
+
+    pub fn winsize(self: Resize) cross.c.struct_winsize {
+        return .{ .ws_row = self.rows, .ws_col = self.cols, .ws_xpixel = self.xpixel, .ws_ypixel = self.ypixel };
+    }
 };
 
 pub fn getTerminalSize(fd: i32) Resize {
@@ -343,17 +353,24 @@ test "Info wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Header));
 }
 
-test "Tag wire values are frozen" {
+test "upstream Tag values remain canonical" {
     inline for (.{
-        .{ Tag.Input, 0 },              .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },             .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },               .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },                .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },             .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
-        .{ Tag.LabelSet, 15 },          .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },              .{ Tag.ControlInit, 19 },  .{ Tag.ControlReady, 20 },
-        .{ Tag.ControlViewport, 21 },   .{ Tag.ControlLive, 22 },  .{ Tag.ControlHistoryChunk, 23 },
-        .{ Tag.ControlHistoryEnd, 24 },
+        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
+        .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
+        .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
+        .{ Tag.EnvData, 21 },
+    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "KKL control tags occupy their distinct internal block" {
+    inline for (.{
+        .{ Tag.ControlInit, 128 },         .{ Tag.ControlReady, 129 },
+        .{ Tag.ControlViewport, 130 },     .{ Tag.ControlLive, 131 },
+        .{ Tag.ControlHistoryChunk, 132 }, .{ Tag.ControlHistoryEnd, 133 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

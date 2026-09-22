@@ -4,7 +4,6 @@ const frame = @import("frame.zig");
 const ipc = @import("../ipc.zig");
 const posix = @import("../posix.zig");
 
-const layout_probe_timeout_ms = 1000;
 const ready_timeout_ms = 1000;
 const eof_drain_ms = 250;
 
@@ -13,42 +12,6 @@ pub const Options = struct {
     cols: ?u16 = null,
     drain_after_stdin_eof: bool = false,
 };
-
-/// LabelGet was introduced before tag 18 became Send. Known current daemons
-/// therefore answer LabelData before the following Info response, while the
-/// legacy KKL control layout ignores numeric tag 14 and answers only Info.
-fn classifyLayoutProbe(tag: ipc.Tag) ?adapter.InternalLayout {
-    return switch (tag) {
-        .LabelData => .current,
-        .Info => .legacy_kkl,
-        else => null,
-    };
-}
-
-pub fn detectLayout(alloc: std.mem.Allocator, socket_path: []const u8) !adapter.InternalLayout {
-    const fd = try ipc.connectSession(socket_path);
-    defer posix.close(fd);
-
-    // Ordering is the capability proof: do not reverse these requests or infer
-    // a legacy layout from timeout alone. Legacy init 18 is current Send.
-    try ipc.send(fd, .LabelGet, "");
-    try ipc.send(fd, .Info, "");
-
-    var incoming = try ipc.SocketBuffer.init(alloc);
-    defer incoming.deinit();
-
-    while (true) {
-        var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = try posix.poll(&poll_fds, layout_probe_timeout_ms);
-        if (ready == 0) return error.ControlLayoutProbeTimeout;
-
-        const n = try incoming.read(fd);
-        if (n == 0) return error.ControlLayoutProbeClosed;
-        while (incoming.next()) |message| {
-            if (classifyLayoutProbe(message.header.tag)) |layout| return layout;
-        }
-    }
-}
 
 fn setNonBlocking(fd: i32) !usize {
     const original = try posix.fcntl(fd, posix.F.GETFL, 0);
@@ -80,7 +43,6 @@ fn flushOutput(alloc: std.mem.Allocator, bytes: *std.ArrayList(u8)) !void {
 
 pub fn run(
     client_fd: i32,
-    layout: adapter.InternalLayout,
     options: Options,
 ) !void {
     // The client may run after ensureSession forked. Keep post-fork allocation
@@ -110,9 +72,9 @@ pub fn run(
     var size = ipc.getTerminalSize(posix.STDOUT_FILENO);
     if (options.rows) |rows| size.rows = rows;
     if (options.cols) |cols| size.cols = cols;
-    try adapter.appendInit(alloc, &to_daemon, layout, size);
+    try adapter.appendInit(alloc, &to_daemon, size);
 
-    var handshake_ready = layout == .legacy_kkl;
+    var handshake_ready = false;
     var stdin_open = true;
     var stdin_eof = false;
     var drain_after_eof = options.drain_after_stdin_eof;
@@ -181,14 +143,13 @@ pub fn run(
             }
 
             while (daemon_input.next()) |message| {
-                if (layout == .current and message.header.tag == .ControlReady) {
+                if (message.header.tag == .ControlReady) {
                     handshake_ready = true;
                     continue;
                 }
                 _ = try adapter.appendOutput(
                     alloc,
                     &to_adapter,
-                    layout,
                     message,
                 );
             }
@@ -210,7 +171,6 @@ pub fn run(
                         _ = try adapter.appendInput(
                             alloc,
                             &to_daemon,
-                            layout,
                             external,
                         );
                         if (external.tag == .close) {
@@ -249,10 +209,4 @@ pub fn run(
             return;
         }
     }
-}
-
-test "layout probe distinguishes known current and legacy tag maps" {
-    try std.testing.expectEqual(adapter.InternalLayout.current, classifyLayoutProbe(.LabelData).?);
-    try std.testing.expectEqual(adapter.InternalLayout.legacy_kkl, classifyLayoutProbe(.Info).?);
-    try std.testing.expectEqual(@as(?adapter.InternalLayout, null), classifyLayoutProbe(.Output));
 }

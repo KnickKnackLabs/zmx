@@ -756,6 +756,7 @@ pub fn serializeViewportSnapshot(alloc: std.mem.Allocator, term: *ghostty_vt.Ter
     if (had_synchronized_output) term.modes.set(.synchronized_output, false);
     defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
 
+    writeColorOverrides(&builder.writer, term);
     var formatter = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
     const pages = &term.screens.active.pages;
     const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
@@ -798,6 +799,26 @@ pub fn serializeViewportSnapshot(alloc: std.mem.Allocator, term: *ghostty_vt.Ter
     };
 }
 
+fn writeDynamicColor(
+    writer: *std.Io.Writer,
+    kind: ghostty_vt.color.Dynamic,
+    dynamic: ghostty_vt.color.DynamicRGB,
+) void {
+    const c = dynamic.override orelse return;
+    writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
+        @intFromEnum(kind), c.r, c.g, c.b,
+    }) catch |err| {
+        std.log.warn("failed to format dynamic color err={s}", .{@errorName(err)});
+    };
+}
+
+fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
+    const colors = &term.colors;
+    writeDynamicColor(writer, .foreground, colors.foreground);
+    writeDynamicColor(writer, .background, colors.background);
+    writeDynamicColor(writer, .cursor, colors.cursor);
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -811,6 +832,9 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+
+    // If state contains color override, restore it.
+    writeColorOverrides(&builder.writer, term);
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -1599,6 +1623,32 @@ test "serializeViewportSnapshot excludes scrollback replay" {
     try testing.expect(std.mem.indexOf(u8, snapshot, "VISIBLE_MARK") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "SCROLL_0") == null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "SCROLL_11") == null);
+}
+
+test "native and control snapshots restore dynamic colors without inventing overrides" {
+    const alloc = testing.allocator;
+    var term = try testCreateTerminal(alloc, testing.io, 40, 5, "");
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    const serializers = .{ serializeTerminalState, serializeViewportSnapshot };
+    inline for (serializers) |serialize| {
+        const snapshot = serialize(alloc, &term) orelse return error.TestUnexpectedNull;
+        defer alloc.free(snapshot);
+        try testing.expect(std.mem.indexOf(u8, snapshot, "\x1b]10;") == null);
+        try testing.expect(std.mem.indexOf(u8, snapshot, "\x1b]11;") == null);
+        try testing.expect(std.mem.indexOf(u8, snapshot, "\x1b]12;") == null);
+    }
+
+    stream.nextSlice("\x1b]10;rgb:12/34/56\x1b\\\x1b]11;rgb:65/43/21\x1b\\\x1b]12;rgb:ab/cd/ef\x1b\\");
+    inline for (serializers) |serialize| {
+        const snapshot = serialize(alloc, &term) orelse return error.TestUnexpectedNull;
+        defer alloc.free(snapshot);
+        try testing.expect(std.mem.indexOf(u8, snapshot, "\x1b]10;rgb:12/34/56\x1b\\") != null);
+        try testing.expect(std.mem.indexOf(u8, snapshot, "\x1b]11;rgb:65/43/21\x1b\\") != null);
+        try testing.expect(std.mem.indexOf(u8, snapshot, "\x1b]12;rgb:ab/cd/ef\x1b\\") != null);
+    }
 }
 
 test "serializeTerminalState excludes synchronized output replay" {
